@@ -287,24 +287,52 @@ class DataSource:
                 self.cfg.provider = "csv"
 
     # ── public API ───────────────────────────────────────────────────────
+    #: suffixes that are never Indian — rejected so a stray US ticker cannot quietly
+    #: pollute the universe (and so `verify` never compares against the wrong feed)
+    _FOREIGN = (".SS", ".SZ", ".L", ".DE", ".HK", ".TO", ".NYSE", ".MC", ".PA", ".SW",
+                ".SI", ".JK", ".KL", ".SG", ".AX", ".VI", ".HE", ".ST", ".T", ".OL", ".DB")
+
     def fetch_symbol(self, symbol: str) -> str:
-        """Apply ``data.symbol_suffix`` (NSE ``.NS`` / BSE ``.BO``) when it is missing."""
+        """Normalise to a yfinance Indian ticker: ``RELIANCE`` -> ``RELIANCE.NS``.
+
+        Indices (``^NSEI``, ``^BSESN``) pass through; non-Indian suffixes raise.
+        """
         s = str(symbol).strip().upper()
-        suf = (self.cfg.symbol_suffix or "").strip()
-        if suf and "." not in s and not s.startswith("^"):
-            s += suf
-        return s
+        suf = (self.cfg.symbol_suffix or ".NS").strip().upper()
+        if s.startswith("^"):
+            return s
+        if "." in s:
+            _, _, tail = s.rpartition(".")
+            if tail in {"NS", "BO"}:
+                return s
+            if tail in {f.lstrip(".") for f in self._FOREIGN} or tail not in {"NS", "BO"}:
+                raise ValueError(f"{symbol!r} is not an NSE/BSE ticker "
+                                 f"(expected a '.{suf.lstrip('.')}') suffix)")
+            return s
+        return s + suf
+
+    def tick_for(self, symbol: str) -> float:
+        """``syminfo.mintick`` by exchange suffix (NSE/BSE equities = 0.05)."""
+        table = self.cfg.tick_sizes or {}
+        s = str(symbol).upper()
+        for suffix, val in table.items():
+            if s.endswith(str(suffix).upper()):
+                return float(val)
+        return float(table.get(s[-3:] if s.startswith("^") else s[s.rfind("."):], 0.05))
 
     def get(self, symbol: str, *, lookback_days: Optional[int] = None,
             end: Optional[str] = None, use_cache: bool = True) -> Bars:
         cfg = self.cfg
-        symbol = self.fetch_symbol(symbol)
         days = int(lookback_days or cfg.lookback_days)
         key = f"{symbol}_{cfg.interval}_{days}d_{end or 'live'}"
         if use_cache:
             cached = self.cache.load(key)
             if cached is not None and len(cached) >= cfg.min_bars:
                 return Bars(symbol=symbol, df=cached, source="cache", live=self.live)
+        try:
+            symbol = self.fetch_symbol(symbol)
+        except ValueError as exc:
+            return Bars(symbol=symbol, df=pd.DataFrame(columns=OHLCV), error=str(exc))
         try:
             if cfg.provider in {"yahoo", "yahoo_chart"}:
                 bars = self._yahoo(symbol, days, end)

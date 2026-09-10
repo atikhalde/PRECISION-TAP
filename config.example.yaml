@@ -7,6 +7,7 @@
 
 data:
   provider: yfinance            # yfinance (live) | yahoo (chart API) | csv (offline) | synthetic
+  # NOTE: market must be NSE or BSE and interval must be 1d — enforced at startup.
   interval: 1d                  # daily TF only — the indicator is designed for it
   market: NSE                   # NSE | BSE (label shown in alerts)
   symbol_suffix: ".NS"          # RELIANCE -> RELIANCE.NS ; use ".BO" for BSE

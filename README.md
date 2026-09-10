@@ -4,6 +4,12 @@ A Python port of the TradingView Pine v6 indicator in [`INDICATOR.txt`](INDICATO
 — *"Institutional OB — Precision Tap & Pre-Order"* — plus a **live market scanner** and a
 **backtest engine** built on the exact same engine code.
 
+> **Scope, enforced in code (not just config):** `data.market` must be **NSE or BSE**, `data.interval`
+> must be **1d**, `symbol_suffix` must be **`.NS`/`.BO`** — anything else raises at startup. Live data
+> comes from **yfinance**. Bare tickers are assumed NSE (`RELIANCE` → `RELIANCE.NS`); a foreign ticker
+> (`AAPL.OQ`) is rejected rather than silently scanned. That keeps the alert set exactly comparable to
+> the TradingView chart you are looking at.
+
 Scan NSE equities on the **daily** timeframe and get a **Telegram alert the moment price taps a
 precision order block (Tap 1)**, with every rule of the indicator enforced: volume-confirmed
 displacement, range/ATR expansion, body fraction, close-location value, structure break,

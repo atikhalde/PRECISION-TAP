@@ -247,12 +247,12 @@ class Scanner:
         if symbol in cache:
             return cache[symbol]
         p = self.cfg.params
-        table = self.cfg.data.tick_sizes or {}
         tick = None
-        for suffix, val in table.items():
-            if str(symbol).upper().endswith(str(suffix).upper()):
-                tick = float(val)
-                break
+        if hasattr(self.source, "tick_for"):
+            try:
+                tick = self.source.tick_for(self.source.fetch_symbol(symbol))
+            except ValueError:
+                tick = None                      # DataSource.get() already reported the error
         if tick is not None and tick != p.mintick:
             p = p.replace(mintick=tick)
         cache[symbol] = p

@@ -6,7 +6,7 @@ import pytest
 
 from precision_tap.backtest import Backtester
 from precision_tap.data import synthetic_frame, write_demo_dataset
-from precision_tap.engine import EV_CONFIRMED, EV_TAP, Params, run_engine
+from precision_tap.engine import EV_APPROACH, EV_CONFIRMED, EV_TAP, Params, run_engine
 from precision_tap.params import AlertConfig, DataConfig, ScanConfig, TradeConfig
 from precision_tap.scanner import Scanner, _market_open, _same_session
 from precision_tap.selftest import GOLDEN, GOLDEN_LIVE, base_params, golden_frame
@@ -49,8 +49,54 @@ def test_mintick_resolution_per_market(demo_data):
     sc = Scanner(cfg, store=None, dry_run=True)
     assert sc._params_for("RELIANCE.NS").mintick == 0.05
     assert sc._params_for("SOMETHING.BO").mintick == 0.05
-    assert sc._params_for("AAPL").mintick == 0.01
+    assert sc._params_for("RELIANCE").mintick == 0.05, "bare symbols are treated as NSE"
+    assert sc._params_for("AAPL.OQ").mintick == 0.01, "foreign tickers never get an NSE tick"
     sc.close()
+
+
+def test_india_and_daily_are_enforced():
+    from precision_tap.params import DataConfig
+    with pytest.raises(ValueError, match="daily"):
+        DataConfig(interval="15m")
+    with pytest.raises(ValueError, match="Indian markets"):
+        DataConfig(market="NASDAQ")
+    with pytest.raises(ValueError, match="symbol_suffix"):
+        DataConfig(symbol_suffix=".L")
+    from precision_tap.data import DataSource
+    src = DataSource(DataConfig())
+    assert src.fetch_symbol("RELIANCE") == "RELIANCE.NS"
+    assert src.fetch_symbol("TCS.BO") == "TCS.BO"
+    assert src.fetch_symbol("^NSEI") == "^NSEI"
+    with pytest.raises(ValueError, match="not an NSE/BSE ticker"):
+        src.fetch_symbol("AAPL.OQ")
+
+
+def test_scanner_alerts_equal_closed_bar_indicator(demo_data):
+    """The EOD scan must emit EXACTLY the indicator's confirmed signal set — no more,
+    no less — for the newest bar. This is the 100%-match contract, end to end."""
+    import precision_tap.data as D
+    cfg = cfg_for(("RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS"), history=demo_data)
+    cfg.alert.recent_bars = 3
+    frames = {s: b.df for s, b in D.DataSource(cfg.data).get_many(cfg.data.universe,
+                                                                progress=False).items() if b.ok}
+    with StateStore(":memory:") as store:
+        sc = Scanner(cfg, store=store, dry_run=True)
+        rep = sc.scan(live=False, progress=False)
+        for st in rep.rows:
+            if not st.ok:
+                continue
+            eng = run_engine(st.df, sc._params_for(st.symbol), symbol=st.symbol,
+                             intrabar_last=False, zone_cap=10 ** 6)
+            n = len(st.df)
+            want = sorted((e.kind, e.bar, e.zid) for e in eng.events if e.bar >= n - 3
+                          and e.kind in (EV_TAP, EV_APPROACH, EV_CONFIRMED))
+            got = sorted((e.kind, e.bar, e.zid) for e in st.events
+                          if e.bar >= n - 3 and e.kind in (EV_TAP, EV_APPROACH, EV_CONFIRMED))
+            assert got == want, (st.symbol, got, want)
+            # and the alert window only ever contains events on the newest bar(s)
+            assert all(e.bar >= n - cfg.alert.recent_bars for _, e in rep.alerts
+                       if e.symbol == st.symbol)
+        sc.close()
 
 
 def test_session_and_staleness_helpers():

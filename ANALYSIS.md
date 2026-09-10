@@ -296,6 +296,15 @@ exhaustion ordering, sweep gating, duplicate veto, eviction, intrabar semantics 
 
 ## 10. NSE/BSE specifics, and the one thing that cannot be made identical
 
+This build is **locked to Indian equities on the daily timeframe** (`DataConfig.__post_init__` raises
+otherwise: `market ∈ {NSE, BSE}`, `interval == "1d"`, `symbol_suffix ∈ {".NS", ".BO"}`). That is a
+correctness decision, not a convenience one: the indicator's gates are all *relative to the bar's
+statistics* — RVOL against the 20-bar volume mean, `range ≥ 1.2·ATR`, `body/range`, CLV, an 8-bar
+structure break, `minAge = 3` bars, `maxTouches = 4` — and every one of those constants was tuned for
+daily candles. On a 15-minute frame the same numbers describe a completely different market structure,
+so "the same indicator" would quietly mean something else. Refusing the input is the honest behaviour;
+the parity claim (§7) only holds on the timeframe the script was written for.
+
 * **Suffix & tick** — `data.symbol_suffix: .NS` (BSE `.BO`) and `tick_sizes: {".NS": 0.05, ".BO": 0.05}`; TradingView's
   `syminfo.mintick` for these equities is 0.05, which feeds `Ticks`/`Auto` buffers and `Distal + 1 tick`.
 * **Session** — `Asia/Kolkata`, 09:15–15:30, Mon–Fri. Pre-open (09:00–09:15) prints are deliberately excluded: the

@@ -275,8 +275,8 @@ class AlertConfig:
     chart: bool = True                         # attach rendered PNG
     chart_bars: int = 120
     top_zones: int = 40                        # rows in the console/markdown watchlist
-    link_template: str = "https://www.tradingview.com/symbol/{exchange}:{symbol}/"
-    default_exchange: str = "NASDAQ"
+    link_template: str = "https://in.tradingview.com/chart/?symbol={exchange}:{symbol}"
+    default_exchange: str = "NSE"
 
     def __post_init__(self) -> None:
         ok = {"new_ob", "approach", "tap1", "tap", "confirmed", "invalidated"}
@@ -340,7 +340,7 @@ class DataConfig:
     cache_dir: str = "data/cache"
     cache_max_age_minutes: int = 30            # TTL for cached bars during live scans
     eod_cache_max_age_minutes: int = 60 * 20   # TTL once the session is closed
-    universe_file: str = "universe/us_large.txt"
+    universe_file: str = "universe/nse.txt"
     universe: List[str] = field(default_factory=list)
     live_intraday_bar: bool = True             # rebuild today's forming daily bar from 1m/5m data
     intraday_interval: str = "5m"
@@ -349,6 +349,35 @@ class DataConfig:
     retry_max: int = 3
     retry_backoff: float = 1.6
     min_bars: int = 90                         # skip symbols with too little history
+
+    _DAILY = {"1d", "d", "daily", "day", "1day"}
+
+    def __post_init__(self) -> None:
+        """Hard constraints for this build: Indian markets, daily timeframe, yfinance live."""
+        self.provider = (self.provider or "yfinance").strip().lower()
+        if self.provider in {"yahoo_chart", "chart", ""}:
+            self.provider = "yahoo"
+        if self.provider == "csv":                       # offline replay of exported NSE history
+            pass
+        self.interval = str(self.interval or "1d").strip().lower()
+        if self.interval in self._DAILY:
+            self.interval = "1d"
+        if self.interval != "1d":
+            raise ValueError(
+                f"data.interval={self.interval!r}: only the daily timeframe is supported. The "
+                "indicator's gates are daily-calibrated (RVOL vs the 20-day volume mean, ATR "
+                "ratios, the 8-day structure break, minAge in bars-of-trading) — alerting on a "
+                "lower frame would silently mean something else.")
+        self.market = (self.market or "NSE").strip().upper()
+        if self.market not in {"NSE", "BSE"}:
+            raise ValueError(
+                f"data.market={self.market!r}: this build scans Indian markets only (NSE or BSE).")
+        self.symbol_suffix = (self.symbol_suffix or ".NS").strip().upper()
+        if self.symbol_suffix not in {".NS", ".BO"}:
+            raise ValueError('data.symbol_suffix must be ".NS" (NSE) or ".BO" (BSE)')
+        if float(self.mintick_default() if hasattr(self, "mintick_default") else 0.0):
+            pass
+        self.universe = [str(s).strip().upper() for s in (self.universe or []) if str(s).strip()]
 
 
 @dataclass
