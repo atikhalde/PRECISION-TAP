@@ -1,0 +1,28 @@
+[Unit]
+Description=Precision Tap — NSE OB/Tap-1 scanner with Telegram alerts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/precision-tap
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/precision-tap
+# secrets live in /etc/precision-tap.env (chmod 600) — not in the repo
+EnvironmentFile=-/etc/precision-tap.env
+ExecStart=/opt/precision-tap/.venv/bin/python -m precision_tap run
+Restart=always
+RestartSec=20
+TimeoutStopSec=60
+KillSignal=SIGINT
+Nice=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# hardening: uncomment once the cache/results paths exist and are writable
+#ReadWritePaths=/opt/precision-tap/data /opt/precision-tap/results /opt/precision-tap/logs
+
+[Install]
+WantedBy=multi-user.target
