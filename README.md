@@ -77,9 +77,17 @@ Python ≥ 3.9. `matplotlib` is only needed for chart attachments / the equity P
 python -m precision_tap doctor --net      # deps, universe, tz/session, token+chat, live data probe
 python -m precision_tap selftest          # 18 Pine-parity checks (offline, deterministic)
 python -m precision_tap demo              # full offline pipeline on synthetic NSE-style data
+python tools/live_drill.py                # the LIVE path offline: fake Yahoo feed → mock Telegram
 python -m precision_tap scan --no-send    # one real cycle, prints instead of sending
 python -m precision_tap verify RELIANCE.NS   # every zone + every event, for TradingView diffing
 ```
+
+`tools/live_drill.py` is the one that catches "it works on my machine but not on the market":
+it drives the real provider code (Yahoo chart API *and* yfinance, both faked) through the
+intraday rebuild of today's forming bar, the scanner, dispatch and the Bot API, and exits
+non-zero unless every alert it found was delivered. Two cycles by default, so it also
+asserts the de-dupe ledger stops the second one re-sending. It needs no network at all —
+which is why it runs in CI on every push.
 
 `verify` is the parity workbench: it prints each zone's `born / origin / top / bot / entry / stop /
 state / taps` and the closed-bar `plotshape` date lists (`displacement→OB created`, `anyTap`,
@@ -243,7 +251,9 @@ precision_tap/
   cli.py        ← the commands above
 tests/          ← pytest: parity wrappers, yfinance adapter (fake), Telegram (local mock),
                   scanner/backtest, and the **live path** (feed freshness, scheduler, delivery)
-universe/nse.txt, config.example.yaml, tools/mock_telegram_server.py, deploy/
+universe/nse.txt, config.example.yaml, deploy/
+tools/live_drill.py        ← offline rehearsal of the LIVE path (fake Yahoo feed + mock Bot API)
+tools/mock_telegram_server.py   ← local stand-in for api.telegram.org
 .github/workflows/   ← ci.yml (offline parity + tests) and live-scan.yml (real market → Telegram)
 ```
 
@@ -258,6 +268,8 @@ universe/nse.txt, config.example.yaml, tools/mock_telegram_server.py, deploy/
 | Alerts repeat yesterday's session | the intraday rebuild failed, so today's bar is missing; the stale guard then suppresses it. Check `data.live_intraday_bar` / `data.intraday_interval` |
 | Alerts on the wrong day / holidays | keep `alerts.skip_stale_bars: true`; NSE holidays produce no new bar |
 | `no data` / rate limited | raise `data.retry_max`, lower `data.rate_limit_per_sec`, or `export-data` once and run `--provider csv` |
+| `usable=0 errors=N` on every symbol | the provider call itself is failing, not the gates. Run `scan -S RELIANCE -v` and read the `fetch failed for …` debug lines: a yfinance upgrade (`progress`/`threads` removed in 1.0) or a tz-aware/naive index clash in the intraday rebuild both look exactly like this. `python tools/live_drill.py` reproduces both offline |
+| Alerts fire but the buy limit is not the price that was touched | expected with `raise_after_first_tap: true` — the zone's pre-order is lifted *on* the tap bar, so the message prints the tapped level as the trigger and the raised level as the next pre-order |
 | One symbol differs from TradingView | compare `data.corporate_adjustments` (adjusted vs raw) and the exact `mintick`; run `verify SYM --end <date>` |
 | Too many messages | `alerts.events: [tap1]`, `once_per_symbol_per_day: true`, `daily_limit: 10`, `alerts.min_liquidity_dollar_volume` up |
 | Need it offline | `python -m precision_tap export-data`, then `--provider csv` everywhere |

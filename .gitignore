@@ -13,3 +13,4 @@ scan-output.txt
 digest.txt
 .pytest_cache/
 .DS_Store
+.ptvenv/

@@ -110,6 +110,77 @@ def _bar_is_today(ts, meta: dict | None = None) -> bool:
         return False
 
 
+def _session_dates(index: pd.Index, tzname: str) -> np.ndarray:
+    """Session (exchange-local) date of every bar in ``index``.
+
+    A tz-aware index is converted to the exchange clock before the date is read;
+    a naive one is *interpreted* as exchange-local.  Comparing raw dates across
+    mixed tz-awareness is what silently drops (or duplicates) today's bar.
+    """
+    try:
+        idx = pd.DatetimeIndex(index)
+        if idx.tz is not None:
+            idx = idx.tz_convert(tzname)
+        else:
+            idx = idx.tz_localize(tzname)
+    except Exception:
+        return np.array([pd.Timestamp(t).date() for t in index], dtype=object)
+    return np.array([pd.Timestamp(t).date() for t in idx], dtype=object)
+
+
+def merge_today_bar(daily: pd.DataFrame, intra: pd.DataFrame, tzname: str,
+                    *, session: Optional[date_cls] = None) -> Optional[pd.DataFrame]:
+    """Rebuild today's forming daily bar from intraday prints and append it.
+
+    Shared by the Yahoo and yfinance providers so both rebuild the session the
+    same way: the session date comes from the *exchange* clock (a UTC-stamped
+    feed otherwise rolls the early IST prints into the previous day), any
+    partial bar the daily series already carries for that session is dropped,
+    and the rebuilt bar is stamped in the daily frame's own tz — concatenating a
+    tz-naive stamp onto a tz-aware index raises in modern pandas, which used to
+    fail the whole symbol fetch mid-session.
+
+    ``session`` is the date the caller expects (today, in exchange time).  A
+    feed whose newest prints belong to an older session then yields ``None``
+    instead of overwriting a *settled* bar with a partial rebuild.
+    """
+    if daily is None or intra is None or len(daily) == 0 or len(intra) == 0:
+        return None
+    try:
+        idx = pd.DatetimeIndex(intra.index)
+        local = idx.tz_convert(tzname) if idx.tz is not None else idx.tz_localize(tzname)
+    except Exception:
+        local = pd.DatetimeIndex(intra.index)
+    if len(local) == 0:
+        return None
+    # compare *dates*: a tz-aware Timestamp never compares equal to a `date`
+    local_dates = np.array([pd.Timestamp(t).date() for t in local], dtype=object)
+    if session is not None and local_dates[-1] != session:
+        return None
+    session = local_dates[-1]
+    mask = local_dates == session
+    todays = intra[mask]
+    if len(todays) == 0:
+        return None
+    stamp = pd.Timestamp(datetime.combine(session, datetime.min.time()))
+    tz = getattr(pd.DatetimeIndex(daily.index), "tz", None)
+    if tz is not None:
+        try:
+            stamp = stamp.tz_localize(tz)
+        except Exception:
+            pass
+    bar = pd.DataFrame({
+        "open": [float(todays["open"].iloc[0])],
+        "high": [float(todays["high"].max())],
+        "low": [float(todays["low"].min())],
+        "close": [float(todays["close"].iloc[-1])],
+        "volume": [float(todays["volume"].sum())],
+    }, index=pd.DatetimeIndex([stamp]))
+    keep = _session_dates(daily.index, tzname) != session
+    out = pd.concat([daily[keep], bar]).sort_index()
+    return normalize_ohlcv(out, daily=True)
+
+
 def normalize_ohlcv(df: pd.DataFrame, *, daily: bool = False) -> pd.DataFrame:
     """Lower-case, coerce numeric, drop incomplete rows, sort, de-duplicate."""
     if df is None or len(df) == 0:
@@ -163,8 +234,16 @@ def apply_adjclose(df: pd.DataFrame, adjclose: Optional[pd.Series]) -> pd.DataFr
     return out
 
 
-def parse_chart_payload(payload: dict, *, daily: bool = True) -> Tuple[pd.DataFrame, dict]:
-    """Parse a Yahoo ``v8/finance/chart`` response into a normalised frame."""
+def parse_chart_payload(payload: dict, *, daily: bool = True,
+                        adjust: bool = True) -> Tuple[pd.DataFrame, dict]:
+    """Parse a Yahoo ``v8/finance/chart`` response into a normalised frame.
+
+    ``adjust`` mirrors ``data.corporate_adjustments``: the endpoint always ships
+    an ``adjclose`` series, so honouring the flag here is what lets a user match
+    a raw (unadjusted) terminal price.  History and today's intraday rebuild
+    must use the *same* setting, or the forming bar is scaled onto a different
+    price basis than every closed bar.
+    """
     chart = (payload or {}).get("chart") or {}
     if chart.get("error"):
         raise RuntimeError(f"yahoo chart error: {chart['error']}")
@@ -191,7 +270,8 @@ def parse_chart_payload(payload: dict, *, daily: bool = True) -> Tuple[pd.DataFr
             pass
     adj = ((res.get("indicators") or {}).get("adjclose") or [{}])
     adjclose = pd.Series(adj[0].get("adjclose"), index=df.index) if adj and adj[0].get("adjclose") else None
-    df = apply_adjclose(df, adjclose)
+    if adjust:
+        df = apply_adjclose(df, adjclose)
     df = normalize_ohlcv(df, daily=daily)
     return df, meta
 
@@ -233,6 +313,32 @@ def read_csv_frame(path: Path, *, daily: bool = True) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 # Providers
 # ─────────────────────────────────────────────────────────────────────────────
+
+_UNEXPECTED_KWARG = re.compile(r"unexpected keyword argument '([A-Za-z_][A-Za-z0-9_]*)'")
+
+
+def _history(ticker, **kwargs: Any):
+    """``ticker.history(**kwargs)`` across yfinance versions.
+
+    yfinance moved ``history()`` onto ``PriceHistory`` and dropped ``progress`` /
+    ``threads`` / ``proxy`` from its signature in 1.0, while ``Ticker.history``
+    still forwards ``**kwargs`` — so the call raises ``TypeError`` on *every*
+    symbol instead of returning bars.  That is invisible until the live scanner
+    reports "no data" for the whole universe, so drop the kwarg the build
+    rejects and retry (rather than guessing the installed version).
+    """
+    for _ in range(4):
+        try:
+            return ticker.history(**kwargs)
+        except TypeError as exc:
+            bad = _UNEXPECTED_KWARG.search(str(exc))
+            if not bad or bad.group(1) not in kwargs:
+                raise
+            log.debug("yfinance %s does not accept %r — retrying without it",
+                      getattr(__import__("yfinance"), "__version__", "?"), bad.group(1))
+            kwargs.pop(bad.group(1))
+    return ticker.history(**kwargs)
+
 
 @dataclass
 class Bars:
@@ -489,7 +595,8 @@ class DataSource:
             params["period2"] = int(end_dt.timestamp())
         payload = self._http_json(url, params)
         daily = self.cfg.interval in ("1d", "d", "daily", "1wk")
-        df, meta = parse_chart_payload(payload, daily=daily)
+        df, meta = parse_chart_payload(payload, daily=daily,
+                                      adjust=self.cfg.corporate_adjustments)
         source = "yahoo"
         if self.live and self.cfg.live_intraday_bar and not end:
             merged, live_flag = self._merge_live_bar(symbol, df)
@@ -513,31 +620,20 @@ class DataSource:
         params = {"interval": self.cfg.intraday_interval, "range": "1d", "includePrePost": "false"}
         try:
             payload = self._http_json(url, params)
-            intra, meta = parse_chart_payload(payload, daily=False)
+            intra, meta = parse_chart_payload(payload, daily=False,
+                                         adjust=self.cfg.corporate_adjustments)
         except Exception as exc:
             log.debug("intraday fetch failed for %s: %s", symbol, exc)
             return None, False
         if intra.empty:
             return None, False
-        tzname = meta.get("exchangeTimezoneName")
-        try:
-            today = pd.Timestamp.now(tz=tzname).date() if tzname else pd.Timestamp.now().date()
-        except Exception:
-            today = intra.index[-1].date()
-        todays = intra[[d == today for d in intra.index.date]]
-        if todays.empty:
+        tzname = meta.get("exchangeTimezoneName") or _market_tz(self.cfg.market)
+        merged = merge_today_bar(daily, intra, tzname, session=_now_tz(tzname).date())
+        if merged is None or merged.empty:
             return None, False
-        agg = pd.DataFrame({
-            "open": todays["open"].iloc[0],
-            "high": todays["high"].max(),
-            "low": todays["low"].min(),
-            "close": todays["close"].iloc[-1],
-            "volume": todays["volume"].sum(),
-        }, index=pd.DatetimeIndex([pd.Timestamp(datetime.combine(today, datetime.min.time()))]))
-        base = daily[~pd.Index([d == today for d in daily.index.date])].copy()
-        merged = pd.concat([base, agg])
-        merged = merged.sort_index()
-        return merged, True
+        # only claim a live bar when the rebuilt bar really is the session the
+        # feed should already have — a merge onto an older session is not live
+        return merged, bool(_bar_is_today(merged.index[-1], meta))
 
     # ── yfinance ─────────────────────────────────────────────────────────
     def _yfinance(self, symbol: str, days: int, end: Optional[str]) -> Bars:
@@ -550,7 +646,7 @@ class DataSource:
         else:
             kwargs["period"] = f"{max(days, 5)}d" if days < 730 else "max"
         tk = yf.Ticker(symbol)
-        raw = tk.history(**kwargs)
+        raw = _history(tk, **kwargs)
         if raw is None or len(raw) == 0:
             raise RuntimeError("yfinance returned no rows")
         raw = raw.rename(columns=str.lower)
@@ -558,6 +654,11 @@ class DataSource:
         df = normalize_ohlcv(raw, daily=daily)
         df = self._trim(df, days)
         meta: Dict[str, Any] = {"symbol": symbol}
+        # The exchange clock is known from the config (NSE/BSE only), and
+        # yfinance >= 1.0 no longer exposes `Ticker.tz` — without it the
+        # "is this bar from today's session?" test falls back to the *host*
+        # clock, which silently disagrees with IST for hours at a time.
+        meta["exchangeTimezoneName"] = _market_tz(self.cfg.market)
         try:
             tzv = getattr(tk, "tz", None)
             if tzv:
@@ -591,9 +692,9 @@ class DataSource:
         series can lag a few minutes during the NSE session.
         """
         try:
-            intra = tk.history(period="1d", interval=self.cfg.intraday_interval,
-                               auto_adjust=self.cfg.corporate_adjustments, progress=False,
-                               threads=False)
+            intra = _history(tk, period="1d", interval=self.cfg.intraday_interval,
+                             auto_adjust=self.cfg.corporate_adjustments, progress=False,
+                             threads=False)
         except Exception as exc:
             log.debug("intraday fetch failed: %s", exc)
             return None
@@ -610,30 +711,7 @@ class DataSource:
         # session date in *exchange* time, not the feed's stamp (a UTC-stamped
         # feed otherwise rolls the early IST bars into the previous day)
         tzname = _market_tz(self.cfg.market)
-        try:
-            local = intra.index.tz_convert(tzname) if getattr(intra.index, "tz", None) is not None \
-                else intra.index.tz_localize(tzname)
-        except Exception:
-            local = intra.index
-        today = local[-1].date()
-        todays = intra[[d == today for d in local.date]]
-        if todays.empty:
-            return None
-        stamp = pd.Timestamp(datetime.combine(today, datetime.min.time()))
-        tz = getattr(daily.index, "tz", None)
-        if tz is not None:
-            try:
-                stamp = stamp.tz_localize(tz)
-            except Exception:
-                pass
-        bar = pd.DataFrame({
-            "open": [todays["open"].iloc[0]], "high": [todays["high"].max()],
-            "low": [todays["low"].min()], "close": [todays["close"].iloc[-1]],
-            "volume": [todays["volume"].sum()],
-        }, index=pd.DatetimeIndex([stamp]))
-        base = daily[~pd.Index([d == today for d in daily.index.date])]
-        out = pd.concat([base, bar]).sort_index()
-        return normalize_ohlcv(out, daily=True)
+        return merge_today_bar(daily, intra, tzname, session=_now_tz(tzname).date())
 
     # ── local csv ────────────────────────────────────────────────────────
     def _csv(self, symbol: str) -> Bars:
