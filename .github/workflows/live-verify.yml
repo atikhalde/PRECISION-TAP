@@ -75,34 +75,28 @@ jobs:
               print("history(progress=…, threads=…) -> TypeError:", exc)
           PY
 
-      - name: 1 · probe with the FIXED code (no alerts sent)
+      - name: 1 · what the engine sees on today's bar (verbose, not sent)
         continue-on-error: true
         run: |
-          python -m precision_tap scan --no-send --no-charts 2>&1 | tee probe.txt
+          python -m precision_tap scan --no-send --no-charts -v --recent-bars 3 \
+            --events tap1,approach,confirmed,tap \
+            --set data.cache_max_age_minutes=0 --set data.eod_cache_max_age_minutes=0 \
+            2>&1 | grep -E "skip |alerts matched|mode=|delivery|^  [A-Z0-9.&-]+\.NS " | head -60 \
+            | tee probe.txt
 
-      - name: 2 · live cycle, fixed code — real delivery (tap events too, capped)
+      - name: 2 · deliver whatever the live market produced
         continue-on-error: true
         run: |
           python -m precision_tap scan --no-charts --messages --recent-bars 3 \
             --events tap1,approach,confirmed,tap \
-            --set alerts.daily_limit=3 2>&1 | tee live.txt
+            --set alerts.daily_limit=5 \
+            --set data.cache_max_age_minutes=0 --set data.eod_cache_max_age_minutes=0 \
+            2>&1 | tail -60 | tee live.txt
 
-      - name: 3 · feed probe (is today's bar really the forming bar?)
+      - name: 3 · feed probe
         continue-on-error: true
         run: |
-          python -m precision_tap doctor --net 2>&1 | tail -12 | tee doctor.txt
-
-      - name: 4 · the same cycle against the PRE-FIX data.py (cold cache)
-        continue-on-error: true
-        run: |
-          git fetch --depth 1 origin "$BASE_SHA" || true
-          git show "$BASE_SHA:precision_tap/data.py" > precision_tap/data.py
-          rm -rf data/cache
-          python -m precision_tap scan --no-send --no-charts \
-            --set data.cache_dir=/tmp/cache_before \
-            --set data.cache_max_age_minutes=0 \
-            --set data.eod_cache_max_age_minutes=0 2>&1 | tail -20 | tee before.txt
-          git checkout -- precision_tap/data.py
+          python -m precision_tap doctor --net 2>&1 | tail -8 | tee doctor.txt
 
       - name: Report back to the PR
         if: always()
