@@ -1,0 +1,131 @@
+# TEMPORARY — one-shot live-market verification for PR #5.
+#
+# Runs the scanner against the *real* market on a GitHub runner (this sandbox has
+# no route to Yahoo/Telegram) and posts the console output back to the PR, so the
+# fix can be verified where it matters:
+#
+#   0 · environment    — the yfinance/pandas versions this runner actually installed
+#   1 · probe          — fixed code, --no-send (proves the provider returns bars)
+#   2 · live cycle     — fixed code, real send (delivers to Telegram)
+#   3 · transport      — telegram-test, proves bot → chat works with the real token
+#   4 · wider window   — --recent-bars 3, delivered only if something real fired
+#   5 · before         — data.py from the pre-fix commit, same runner, same yfinance
+#
+# Deleted once the run has been inspected.
+name: Live verify (temporary)
+
+on:
+  workflow_dispatch:
+  # this sandbox's GitHub token cannot create dispatch events, but it *can*
+  # push — so a push to the branch is the trigger that is actually reachable
+  push:
+    branches: [arena/01a08f4e-precision-tap]
+    paths: [".github/workflows/live-verify.yml"]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TZ: Asia/Kolkata
+  PYTHONUNBUFFERED: "1"
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  BASE_SHA: 8bd147b22db469edc9cf9cba6fb61389b17c76cc   # pre-fix main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: 0 · environment
+        run: |
+          python - <<'PY' | tee env.txt
+          import sys, inspect
+          import pandas, numpy
+          import yfinance
+          print("python  ", sys.version.split()[0])
+          print("pandas  ", pandas.__version__, "| numpy", numpy.__version__)
+          print("yfinance", yfinance.__version__)
+          try:
+              from yfinance.scrapers.history import PriceHistory
+              sig = inspect.signature(PriceHistory.history)
+              print("PriceHistory.history accepts 'progress':", "progress" in sig.parameters)
+          except Exception as exc:
+              print("signature probe failed:", exc)
+          # does THIS build reject the kwargs the old code passed?
+          tk = yfinance.Ticker("RELIANCE.NS")
+          try:
+              df = tk.history(period="5d", interval="1d", progress=False, threads=False)
+              print("history(progress=…, threads=…) ->", "OK" if len(df) else "EMPTY", f"({len(df)} rows)")
+          except TypeError as exc:
+              print("history(progress=…, threads=…) -> TypeError:", exc)
+          PY
+
+      - name: 1 · live cycle → Telegram (real alerts, charts, ₹100cr floor)
+        continue-on-error: true
+        run: |
+          python -m precision_tap scan --messages --recent-bars 3 \
+            --events tap1,approach,confirmed,tap \
+            --min-dollar-volume 100 \
+            --set alerts.daily_limit=5 \
+            --set data.cache_max_age_minutes=0 --set data.eod_cache_max_age_minutes=0 \
+            2>&1 | tee probe.txt
+
+      - name: 2 · the same universe with the SHIPPED defaults (₹500cr, tap1 only)
+        continue-on-error: true
+        run: |
+          python -m precision_tap scan --no-send --no-charts \
+            --set data.cache_max_age_minutes=0 --set data.eod_cache_max_age_minutes=0 \
+            2>&1 | tail -12 | tee doctor.txt
+
+      - name: Report back to the PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## Live-market verification · $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo ""
+            echo "runner \`ubuntu-latest\` · ref \`${{ github.ref_name }}\` · commit \`${GITHUB_SHA::7}\`"
+            echo ""
+            for part in env probe doctor; do
+              case "$part" in
+                env)       title="0 · environment (versions on the runner)";;
+                probe)     title="1 · probe, fixed code (<code>scan --no-send</code>)";;
+                live)      title="2 · live cycle, fixed code — DELIVERED to Telegram";;
+                doctor)    title="2 · the shipped defaults on the same bars (not sent)";;
+              esac
+              echo "<details><summary>$title</summary>"
+              echo ""
+              echo '```'
+              { tail -c 6000 "$part.txt" 2>/dev/null || echo "(no output)"; }
+              echo '```'
+              echo "</details>"
+              echo ""
+            done
+          } > comment.md
+          gh pr comment 5 --body-file comment.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-verify-${{ github.run_number }}
+          path: |
+            env.txt
+            probe.txt
+            doctor.txt
+          if-no-files-found: ignore

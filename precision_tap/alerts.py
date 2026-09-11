@@ -129,7 +129,14 @@ def render_lines(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) -> Li
 
     if z is None:
         return lines
-    entry = float(ctx.get("entry") or z.entry)
+    entry_now = float(ctx.get("entry") or z.entry)
+    # On a tap the head-line level must be the one that was actually touched —
+    # `raise_after_first_tap` lifts the zone's pre-order *on the tap bar*, so
+    # `zone.entry` is already the NEXT level by the time we render (the Pine
+    # label makes the same distinction: "TAP n" at the touched price, then
+    # "Next <raised>"). Everything else (approach, confirm, invalidation) is
+    # about the level that is live right now.
+    entry = float(ev.level) if (ev.kind == EV_TAP and math.isfinite(ev.level)) else entry_now
     stop = float(z.stop)
     risk = entry - stop
     targets: List[str] = []
@@ -155,7 +162,8 @@ def render_lines(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) -> Li
     if z.departed:
         facts.append("departure ✔")
     if z.adaptive:
-        facts.append(f"level raised after Tap 1 → {_num(z.entry)}")
+        facts.append(f"next pre-order {_num(entry_now)} · raised after Tap 1"
+                     if ev.kind == EV_TAP else f"level raised after Tap 1 → {_num(z.entry)}")
     if ev.kind == EV_TAP and getattr(params, "require_sweep", False) \
             and ev.detail.get("swept") is not None:
         facts.append("sweep ✔" if ev.detail.get("swept") else "no sweep")
