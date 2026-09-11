@@ -4,20 +4,18 @@
 # no route to Yahoo/Telegram) and posts the console output back to the PR, so the
 # fix can be verified where it matters:
 #
-#   1. probe   — fixed code,   --no-send   (proves the provider returns bars)
-#   2. live    — fixed code,   real send   (proves delivery to Telegram)
-#   3. before  — data.py from the pre-fix commit, same runner, same yfinance
+#   0 · environment    — the yfinance/pandas versions this runner actually installed
+#   1 · probe          — fixed code, --no-send (proves the provider returns bars)
+#   2 · live cycle     — fixed code, real send (delivers to Telegram)
+#   3 · transport      — telegram-test, proves bot → chat works with the real token
+#   4 · wider window   — --recent-bars 3, delivered only if something real fired
+#   5 · before         — data.py from the pre-fix commit, same runner, same yfinance
 #
 # Deleted once the run has been inspected.
 name: Live verify (temporary)
 
 on:
   workflow_dispatch:
-    inputs:
-      symbols:
-        description: "Universe for the verification run"
-        required: false
-        default: "RELIANCE,TCS,INFY,HDFCBANK,SBIN,ICICIBANK"
   # this sandbox's GitHub token cannot create dispatch events, but it *can*
   # push — so a push to the branch is the trigger that is actually reachable
   push:
@@ -52,30 +50,64 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-          python -c "import yfinance, pandas; print('yfinance', yfinance.__version__, '| pandas', pandas.__version__)"
+
+      - name: 0 · environment
+        run: |
+          python - <<'PY' | tee env.txt
+          import sys, inspect
+          import pandas, numpy
+          import yfinance
+          print("python  ", sys.version.split()[0])
+          print("pandas  ", pandas.__version__, "| numpy", numpy.__version__)
+          print("yfinance", yfinance.__version__)
+          try:
+              from yfinance.scrapers.history import PriceHistory
+              sig = inspect.signature(PriceHistory.history)
+              print("PriceHistory.history accepts 'progress':", "progress" in sig.parameters)
+          except Exception as exc:
+              print("signature probe failed:", exc)
+          # does THIS build reject the kwargs the old code passed?
+          tk = yfinance.Ticker("RELIANCE.NS")
+          try:
+              df = tk.history(period="5d", interval="1d", progress=False, threads=False)
+              print("history(progress=…, threads=…) ->", "OK" if len(df) else "EMPTY", f"({len(df)} rows)")
+          except TypeError as exc:
+              print("history(progress=…, threads=…) -> TypeError:", exc)
+          PY
 
       - name: 1 · probe with the FIXED code (no alerts sent)
         continue-on-error: true
         run: |
-          python -m precision_tap scan --no-send --messages --no-charts \
-            -S ${{ inputs.symbols }} 2>&1 | tee probe.txt
-          echo "exit=${PIPESTATUS[0]}"
+          python -m precision_tap scan --no-send --no-charts 2>&1 | tee probe.txt
 
       - name: 2 · live cycle with the FIXED code (delivers to Telegram)
-        id: live
         continue-on-error: true
         run: |
-          python -m precision_tap scan --no-charts -S ${{ inputs.symbols }} 2>&1 | tee live.txt
-          echo "exit=${PIPESTATUS[0]}"
+          python -m precision_tap scan --no-charts 2>&1 | tee live.txt
 
-      - name: 3 · the same probe against the PRE-FIX data.py
+      - name: 3 · transport check (bot token -> chat)
+        continue-on-error: true
+        run: |
+          python -m precision_tap telegram-test 2>&1 | tee telegram.txt
+
+      - name: 4 · wider alert window, delivered only if something real fired
+        continue-on-error: true
+        run: |
+          python -m precision_tap scan --no-send --no-charts --recent-bars 3 \
+            -v 2>&1 | tail -40 | tee wide.txt
+          if grep -qE "alerts matched: [1-9]" wide.txt; then
+            echo "--- sending the same cycle for real ---"
+            python -m precision_tap scan --no-charts --recent-bars 3 2>&1 | tail -25 | tee wide_send.txt
+          else
+            echo "nothing to deliver in the wider window" | tee wide_send.txt
+          fi
+
+      - name: 5 · the same probe against the PRE-FIX data.py
         continue-on-error: true
         run: |
           git fetch --depth 1 origin "$BASE_SHA" || true
           git show "$BASE_SHA:precision_tap/data.py" > precision_tap/data.py
-          python -m precision_tap scan --no-send --no-charts \
-            -S ${{ inputs.symbols }} 2>&1 | tee before.txt
-          echo "exit=${PIPESTATUS[0]}"
+          python -m precision_tap scan --no-send --no-charts 2>&1 | tee before.txt
           git checkout -- precision_tap/data.py
 
       - name: Report back to the PR
@@ -86,28 +118,26 @@ jobs:
           {
             echo "## Live-market verification · $(date -u +'%Y-%m-%d %H:%M UTC')"
             echo ""
-            echo "runner: ubuntu-latest · event \`${{ github.event_name }}\` · ref \`${{ github.ref_name }}\`"
+            echo "runner \`ubuntu-latest\` · ref \`${{ github.ref_name }}\` · commit \`${GITHUB_SHA::7}\`"
             echo ""
-            echo "<details><summary>1 · probe, fixed code (<code>scan --no-send</code>)</summary>"
-            echo ""
-            echo '```'
-            cat probe.txt 2>/dev/null || echo "(no output)"
-            echo '```'
-            echo "</details>"
-            echo ""
-            echo "<details><summary>2 · live cycle, fixed code (delivered to Telegram)</summary>"
-            echo ""
-            echo '```'
-            cat live.txt 2>/dev/null || echo "(no output)"
-            echo '```'
-            echo "</details>"
-            echo ""
-            echo "<details><summary>3 · the same probe with the pre-fix <code>data.py</code></summary>"
-            echo ""
-            echo '```'
-            cat before.txt 2>/dev/null || echo "(no output)"
-            echo '```'
-            echo "</details>"
+            for part in env probe live telegram wide wide_send before; do
+              case "$part" in
+                env)       title="0 · environment (versions on the runner)";;
+                probe)     title="1 · probe, fixed code (<code>scan --no-send</code>)";;
+                live)      title="2 · live cycle, fixed code (delivered to Telegram)";;
+                telegram)  title="3 · transport check (<code>telegram-test</code>)";;
+                wide)      title="4 · wider window, <code>--recent-bars 3</code> (not sent)";;
+                wide_send) title="4b · wider window, delivered";;
+                before)    title="5 · the same probe with the pre-fix <code>data.py</code>";;
+              esac
+              echo "<details><summary>$title</summary>"
+              echo ""
+              echo '```'
+              { tail -c 6000 "$part.txt" 2>/dev/null || echo "(no output)"; }
+              echo '```'
+              echo "</details>"
+              echo ""
+            done
           } > comment.md
           gh pr comment 5 --body-file comment.md
 
@@ -116,7 +146,11 @@ jobs:
         with:
           name: live-verify-${{ github.run_number }}
           path: |
+            env.txt
             probe.txt
             live.txt
+            telegram.txt
+            wide.txt
+            wide_send.txt
             before.txt
           if-no-files-found: ignore
