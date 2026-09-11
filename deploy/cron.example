@@ -7,11 +7,19 @@ TZ=Asia/Kolkata
 PATH=/opt/precision-tap/.venv/bin:/usr/local/bin:/usr/bin:/bin
 MAILTO=""
 
-# intraday touch checks every 15 min during the session
-*/15 9-15 * * 1-5  cd /opt/precision-tap && python -m precision_tap scan --live >> logs/cron.log 2>&1
+# IMPORTANT: plain `scan` (auto mode) everywhere — the mode follows the *market
+# clock*, not the trigger.  Forcing `--live` outside 09:15–15:30 makes every
+# symbol skip with "live bar unavailable" (there is no forming bar to read),
+# and forcing `--eod` mid-session blinds the cycle to intraday taps.
+#
+# intraday touch checks every 15 min during the session (first at 09:30, once
+# the opening prints exist; last at 15:30, the closing auction)
+30,45 9 * * 1-5     cd /opt/precision-tap && python -m precision_tap scan >> logs/cron.log 2>&1
+*/15 10-14 * * 1-5   cd /opt/precision-tap && python -m precision_tap scan >> logs/cron.log 2>&1
+0,15,30 15 * * 1-5   cd /opt/precision-tap && python -m precision_tap scan >> logs/cron.log 2>&1
 # the close print + settled EOD bar (authoritative, closed-bar = indicator-exact)
 35 15 * * 1-5      cd /opt/precision-tap && python -m precision_tap scan >> logs/cron.log 2>&1
 10 16 * * 1-5      cd /opt/precision-tap && python -m precision_tap scan >> logs/cron.log 2>&1
 # weekly housekeeping + a fresh data cache for weekend backtesting
 45 18 * * 0        cd /opt/precision-tap && python -m precision_tap export-data --days 2000 >> logs/cron.log 2>&1
-55 18 * * 0        cd /opt/precision-tap && sqlite3 data/state.sqlite3 "DELETE FROM alerts WHERE created_at < datetime('now','-120 day');" >> logs/cron.log 2>&1
+55 18 * * 0        cd /opt/precision-tap && sqlite3 data/state.sqlite3 "DELETE FROM alerts WHERE created_at < datetime('now','-120 day'); DELETE FROM runs WHERE started_at < datetime('now','-120 day');" >> logs/cron.log 2>&1

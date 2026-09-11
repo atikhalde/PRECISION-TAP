@@ -416,16 +416,22 @@ class Cache:
 
 class RateLimiter:
     def __init__(self, per_sec: float):
+        import threading
         self.min_gap = (1.0 / per_sec) if per_sec and per_sec > 0 else 0.0
         self._next = 0.0
+        self._lock = threading.Lock()
 
     def wait(self) -> None:
         if self.min_gap <= 0:
             return
-        now = time.monotonic()
-        if now < self._next:
-            time.sleep(self._next - now)
-        self._next = max(now, self._next) + self.min_gap
+        # get_many() fans out across threads sharing one limiter — without the
+        # lock every worker reads the same `_next` and the throttle collapses.
+        with self._lock:
+            now = time.monotonic()
+            if now < self._next:
+                time.sleep(self._next - now)
+                now = time.monotonic()
+            self._next = max(now, self._next) + self.min_gap
 
 
 class DataSource:
@@ -439,7 +445,10 @@ class DataSource:
         self.limiter = RateLimiter(cfg.rate_limit_per_sec)
         self.proxy = proxy or ""
         self._session = None
-        if cfg.provider in {"yahoo"}:
+        # The session serves the `yahoo` provider *and* the yfinance→yahoo
+        # failover, so it is built whenever either side may need HTTP — not
+        # only when `yahoo` is the primary.
+        if cfg.provider in {"yahoo"} or getattr(cfg, "fallback_provider", "") == "yahoo":
             try:
                 import requests  # noqa: F401
                 self._session = requests.Session()
@@ -447,8 +456,12 @@ class DataSource:
                 if self.proxy:
                     self._session.proxies.update({"http": self.proxy, "https": self.proxy})
             except Exception as exc:
-                log.warning("requests unavailable (%s) — falling back to csv/synthetic", exc)
-                self.cfg.provider = "csv"
+                if cfg.provider == "yahoo":
+                    log.warning("requests unavailable (%s) — falling back to csv/synthetic", exc)
+                    self.cfg.provider = "csv"
+                else:
+                    log.warning("requests unavailable (%s) — yahoo failover disabled", exc)
+                    self.cfg.fallback_provider = ""
 
     @property
     def live(self) -> bool:
@@ -523,22 +536,47 @@ class DataSource:
         except ValueError as exc:
             return Bars(symbol=symbol, df=pd.DataFrame(columns=OHLCV), error=str(exc))
         try:
-            if cfg.provider in {"yahoo", "yahoo_chart"}:
-                bars = self._yahoo(symbol, days, end)
-            elif cfg.provider == "yfinance":
-                bars = self._yfinance(symbol, days, end)
-            elif cfg.provider in {"csv", "file", "local"}:
-                bars = self._csv(symbol)
-            elif cfg.provider in {"synthetic", "demo"}:
-                bars = self._synthetic(symbol, days)
-            else:
-                raise ValueError(f"unknown data.provider {cfg.provider!r}")
+            bars = self._fetch(symbol, days, end, cfg.provider)
         except Exception as exc:
-            log.debug("fetch failed for %s: %s", symbol, exc)
-            return Bars(symbol=symbol, df=pd.DataFrame(columns=OHLCV), error=str(exc))
+            log.debug("fetch failed for %s via %s: %s", symbol, cfg.provider, exc)
+            bars = Bars(symbol=symbol, df=pd.DataFrame(columns=OHLCV),
+                        error=f"{cfg.provider}: {exc}")
+        # Per-symbol failover: the two live providers hit the same Yahoo data
+        # through different transports (curl_cffi vs requests), so a yfinance
+        # outage/rate-limit rarely takes the chart API down with it.  Failing
+        # the whole symbol over keeps one provider's bad hour from zeroing the
+        # entire scan — the outcome is still reported per symbol, never hidden.
+        if not bars.ok and bars.error and getattr(cfg, "fallback_provider", "") and end is None:
+            fb = cfg.fallback_provider
+            primary_error = bars.error
+            try:
+                bars = self._fetch(symbol, days, end, fb)
+                if bars.ok:
+                    log.info("failover %s: %s failed (%s) — served by %s", symbol,
+                             cfg.provider, primary_error[:120], fb)
+                    bars.source = f"{bars.source}+failover"
+                else:
+                    bars = Bars(symbol=symbol, df=pd.DataFrame(columns=OHLCV),
+                                error=f"{cfg.provider}: {primary_error}; {fb}: {bars.error}")
+            except Exception as exc2:
+                log.debug("failover fetch failed for %s via %s: %s", symbol, fb, exc2)
+                bars = Bars(symbol=symbol, df=pd.DataFrame(columns=OHLCV),
+                            error=f"{cfg.provider}: {primary_error}; {fb}: {exc2}")
         if bars.ok and use_cache and bars.source != "cache":
             self.cache.store(key, bars.df)
         return bars
+
+    def _fetch(self, symbol: str, days: int, end: Optional[str], provider: str) -> Bars:
+        """Fetch one symbol via one provider (no cache, no failover)."""
+        if provider in {"yahoo", "yahoo_chart"}:
+            return self._yahoo(symbol, days, end)
+        if provider == "yfinance":
+            return self._yfinance(symbol, days, end)
+        if provider in {"csv", "file", "local"}:
+            return self._csv(symbol)
+        if provider in {"synthetic", "demo"}:
+            return self._synthetic(symbol, days)
+        raise ValueError(f"unknown data.provider {provider!r}")
 
     # ── cache freshness ──────────────────────────────────────────────────
     def _tracks_live_market(self, end: Optional[str]) -> bool:
@@ -678,19 +716,55 @@ class DataSource:
         return merged, bool(_bar_is_today(merged.index[-1], meta))
 
     # ── yfinance ─────────────────────────────────────────────────────────
+    def _yfinance_history(self, tk, kwargs: Dict[str, Any], *, what: str) -> Any:
+        """One ``Ticker.history()`` call with throttling + transient retries.
+
+        The ``yahoo`` provider path has always had both; the yfinance path had
+        neither, so a single rate-limit (429), timeout or curl hiccup during a
+        128-symbol live scan killed the symbol outright — and a bad few seconds
+        could zero the whole cycle.  Retries use the same ``retry_max`` /
+        ``retry_backoff`` knobs as the chart-API path.
+        """
+        last: Optional[Exception] = None
+        for attempt in range(1, max(1, self.cfg.retry_max) + 1):
+            self.limiter.wait()
+            try:
+                return _history(tk, **dict(kwargs))
+            except TypeError:
+                raise                                   # a signature problem, not transient
+            except Exception as exc:
+                last = exc
+                if attempt >= max(1, self.cfg.retry_max):
+                    break
+                log.debug("%s: yfinance attempt %d/%d failed (%s) — retrying",
+                          what, attempt, self.cfg.retry_max, exc)
+                time.sleep(self.cfg.retry_backoff ** attempt)
+        raise RuntimeError(f"yfinance {what} failed after {self.cfg.retry_max} tries: {last}")
+
     def _yfinance(self, symbol: str, days: int, end: Optional[str]) -> Bars:
         import yfinance as yf
         kwargs: Dict[str, Any] = dict(interval=self.cfg.interval, auto_adjust=self.cfg.corporate_adjustments,
                                        progress=False, threads=False)
         if end:
-            kwargs["end"] = str(pd.Timestamp(end).date())
-            kwargs["start"] = str((pd.Timestamp(end) - timedelta(days=days)).date())
+            end_day = pd.Timestamp(end).date()
+            kwargs["end"] = str(end_day)
+            kwargs["start"] = str(end_day - timedelta(days=int(days * 1.6) + 10))
         else:
-            kwargs["period"] = f"{max(days, 5)}d" if days < 730 else "max"
+            # A bounded start/end window, not period="max": "max" downloads the
+            # full listing history (~7k bars for RELIANCE) only for _trim() to
+            # throw 85% of it away — slow, and the heaviest possible call to
+            # make 128× per cycle against a rate-limited endpoint.
+            today = _now_tz(_market_tz(self.cfg.market)).date()
+            kwargs["start"] = str(today - timedelta(days=int(days * 1.6) + 10))
+            kwargs["end"] = str(today + timedelta(days=1))
         tk = yf.Ticker(symbol)
-        raw = _history(tk, **kwargs)
+        raw = self._yfinance_history(tk, kwargs, what=f"daily {symbol}")
         if raw is None or len(raw) == 0:
             raise RuntimeError("yfinance returned no rows")
+        if isinstance(getattr(raw, "columns", None), pd.MultiIndex):
+            # yfinance occasionally returns ("Price", "Ticker") levels — flatten
+            # so normalisation sees plain Open/High/Low/Close/Volume.
+            raw.columns = [c[0] if isinstance(c, tuple) and c else c for c in raw.columns]
         raw = raw.rename(columns=str.lower)
         daily = self.cfg.interval in ("1d", "d", "daily")
         df = normalize_ohlcv(raw, daily=daily)
@@ -734,14 +808,17 @@ class DataSource:
         series can lag a few minutes during the NSE session.
         """
         try:
-            intra = _history(tk, period="1d", interval=self.cfg.intraday_interval,
-                             auto_adjust=self.cfg.corporate_adjustments, progress=False,
-                             threads=False)
+            intra = self._yfinance_history(
+                tk, dict(period="1d", interval=self.cfg.intraday_interval,
+                         auto_adjust=self.cfg.corporate_adjustments, progress=False,
+                         threads=False), what=f"intraday {getattr(tk, 'symbol', '?')}")
         except Exception as exc:
             log.debug("intraday fetch failed: %s", exc)
             return None
         if intra is None or len(intra) == 0:
             return None
+        if isinstance(getattr(intra, "columns", None), pd.MultiIndex):
+            intra.columns = [c[0] if isinstance(c, tuple) and c else c for c in intra.columns]
         intra = normalize_ohlcv(intra.rename(columns=str.lower), daily=False)
         if getattr(intra.index, "tz", None) is None and getattr(daily.index, "tz", None) is not None:
             try:

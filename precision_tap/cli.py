@@ -293,6 +293,24 @@ def cmd_scan(args) -> int:
         for note in rep.notes:
             print("  note:", note)
         sc.close()
+        # A green exit must mean "the scan genuinely worked".  Two states are
+        # broken-pipeline states, not quiet markets, and must fail loudly so a
+        # scheduler (cron / GitHub Actions) shows red instead of silent green:
+        # the feed failing outright, or signals that never reached Telegram
+        # (bad chat id, blocked bot).  A cycle skipped for lack of a fresh bar
+        # (NSE holiday, lagging vendor) stays green — failing it would spam a
+        # red X + a failure ping on every 15-min slot of every holiday.
+        if rep.universe > 0 and rep.usable == 0 and rep.errors > rep.skipped_symbols:
+            print(f"\nSCAN FAILED: 0/{rep.universe} symbols usable — "
+                  f"errors={rep.errors} skipped={rep.skipped_symbols} "
+                  f"(feed outage or provider misconfiguration; see the notes above)",
+                  file=sys.stderr)
+            return 3
+        d = rep.dispatch
+        if d is not None and not isinstance(d, dict) and getattr(d, "undelivered", 0):
+            print(f"\nSCAN FAILED: {d.undelivered} alert(s) found but NOT delivered — {d}",
+                  file=sys.stderr)
+            return 4
     return 0
 
 
@@ -311,8 +329,22 @@ def cmd_run(args) -> int:
                         stop_after=(time.monotonic() + args.duration) if args.duration else None)
         try:
             if args.once:
-                loop._scan("once")
+                rep = loop._scan("once")
                 print("single cycle finished")
+                # same contract as `scan`: a one-shot cron cycle that evaluated
+                # nothing, or delivered nothing it found, must exit loudly.
+                if rep is None:
+                    print("RUN FAILED: the cycle crashed — see the log", file=sys.stderr)
+                    return 1
+                if rep.universe > 0 and rep.usable == 0 and rep.errors > rep.skipped_symbols:
+                    print(f"RUN FAILED: 0/{rep.universe} symbols usable "
+                          f"(errors={rep.errors} skipped={rep.skipped_symbols})", file=sys.stderr)
+                    return 3
+                d = rep.dispatch
+                if d is not None and not isinstance(d, dict) and getattr(d, "undelivered", 0):
+                    print(f"RUN FAILED: {d.undelivered} alert(s) NOT delivered — {d}",
+                          file=sys.stderr)
+                    return 4
                 return 0
             return loop.run()
         finally:
@@ -480,6 +512,38 @@ def cmd_alerts(args) -> int:
 def cmd_telegram(args) -> int:
     cfg = _cfg(args)
     tg = TelegramClient(cfg.telegram)
+    if getattr(args, "validate_only", False):
+        # No message is sent: getMe proves the token, getChat proves each chat
+        # id exists *and* the bot can see it (started / added / admin where
+        # needed).  This is the check the live-scan workflow runs before every
+        # cycle — a bad chat id fails here instead of eating alerts silently.
+        if not cfg.telegram.bot_token:
+            print("TELEGRAM_BOT_TOKEN is required")
+            return 2
+        if not cfg.telegram.chat_ids:
+            print("no chat ids configured (TELEGRAM_CHAT_ID)")
+            return 2
+        try:
+            found = tg.validate_chats()
+        except Exception as exc:
+            print(f"VALIDATION FAILED: {exc}")
+            if "chat not found" in str(exc).lower():
+                print("→ the chat id is wrong, or you never pressed Start on the bot "
+                      "(in a group/channel, add the bot first)")
+            elif "bot was blocked" in str(exc).lower() or "blocked" in str(exc).lower():
+                print("→ the bot was blocked by the user — unblock it and press Start")
+            elif "unauthorized" in str(exc).lower() or "401" in str(exc):
+                print("→ the bot token is wrong or was revoked — check @BotFather")
+            return 1
+        me = found.get("bot", {}) or {}
+        print(f"bot: @{me.get('username', '?')} ({me.get('first_name', '')})")
+        for chat_id, info in (found.get("chats") or {}).items():
+            info = info or {}
+            title = info.get("title") or info.get("username") or (
+                f"{info.get('first_name', '')} {info.get('last_name', '')}".strip())
+            print(f"  chat {chat_id}: ok · type={info.get('type')} · {title or '—'}")
+        print("VALIDATION PASSED: token + chat(s) can receive alerts")
+        return 0
     if args.discover:
         if not cfg.telegram.bot_token:
             print("TELEGRAM_BOT_TOKEN is required to discover chats")
@@ -812,6 +876,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("telegram-test", help="ping the bot")
     _common(p); p.add_argument("--discover", action="store_true")
+    p.add_argument("--validate-only", action="store_true",
+                   help="check token + chat id(s) via getMe/getChat without sending anything")
     p.add_argument("--timeout", type=float, default=25.0)
     p.add_argument("--text", default=None)
     p.set_defaults(fn=cmd_telegram)

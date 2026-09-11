@@ -331,6 +331,7 @@ class LiveConfig:
 @dataclass
 class DataConfig:
     provider: str = "yfinance"                 # yfinance | yahoo | csv | synthetic
+    fallback_provider: str = "yahoo"           # per-symbol failover when the primary errors ("" = off)
     market: str = "NSE"                        # NSE | BSE — labels + tick-size defaults
     symbol_suffix: str = ".NS"                 # appended when a symbol has no suffix (BSE: .BO)
     tick_sizes: Dict[str, float] = field(default_factory=lambda: {".NS": 0.05, ".BO": 0.05})
@@ -357,6 +358,15 @@ class DataConfig:
         self.provider = (self.provider or "yfinance").strip().lower()
         if self.provider in {"yahoo_chart", "chart", ""}:
             self.provider = "yahoo"
+        self.fallback_provider = (self.fallback_provider or "").strip().lower()
+        if self.fallback_provider in {"yahoo_chart", "chart"}:
+            self.fallback_provider = "yahoo"
+        if self.fallback_provider == self.provider:
+            self.fallback_provider = ""        # failing over to yourself is not a fallback
+        if self.fallback_provider and self.fallback_provider not in {"yahoo", "yfinance"}:
+            raise ValueError(
+                f"data.fallback_provider={self.fallback_provider!r}: only 'yahoo'/'yfinance' "
+                "can serve the live market (csv/synthetic are frozen replays)")
         if self.provider == "csv":                       # offline replay of exported NSE history
             pass
         self.interval = str(self.interval or "1d").strip().lower()

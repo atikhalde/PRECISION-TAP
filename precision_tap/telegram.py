@@ -247,10 +247,19 @@ class TelegramClient:
         self._require_config()
         chats = [str(chat_id)] if chat_id else [str(c) for c in self.cfg.chat_ids]
         results: List[SendResult] = []
+        if len(caption or "") > 1024:
+            # A photo caption is capped at 1024 chars by the Bot API — silently
+            # truncating would eat the stop/targets/defence lines.  The alert
+            # text matters more than the picture, so send the full text instead.
+            log.debug("caption is %d chars (>1024) — sending text instead of photo",
+                      len(caption))
+            for chat in chats:
+                results.extend(self.send_text(caption, chat_id=chat, reply_markup=reply_markup))
+            return results
         for chat in chats:
             self._throttle(chat)
             fields = {
-                "chat_id": chat, "caption": caption[:1024],
+                "chat_id": chat, "caption": caption,
                 "disable_notification": 1 if self.cfg.disable_notification else 0,
             }
             if self.cfg.parse_mode in ("HTML", "MARKDOWNV2", "MARKDOWN"):
@@ -281,6 +290,26 @@ class TelegramClient:
 
     def get_me(self) -> Dict[str, Any]:
         return self._post("getMe", {}).get("result", {})
+
+    def get_chat(self, chat_id: str) -> Dict[str, Any]:
+        """Describe a chat without sending anything (validates token + chat id + membership).
+
+        ``getMe`` only proves the token is real; a mistyped ``TELEGRAM_CHAT_ID``
+        — or a bot that was never started / added to the group — fails later at
+        *send* time, when the alert is already built.  ``getChat`` surfaces that
+        misconfiguration up front: it raises ``TelegramPermanentError`` (400)
+        for an unknown chat and 403 when the bot cannot see it.
+        """
+        return self._post("getChat", {"chat_id": str(chat_id)}).get("result", {})
+
+    def validate_chats(self) -> Dict[str, Any]:
+        """``getMe`` + ``getChat`` per configured chat. Returns ``{chat_id: info}``."""
+        self._require_config()
+        me = self.get_me()
+        chats: Dict[str, Any] = {}
+        for chat in [str(c) for c in self.cfg.chat_ids]:
+            chats[chat] = self.get_chat(chat)
+        return {"bot": me, "chats": chats}
 
     def get_updates(self, offset: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
         fields: Dict[str, Any] = {"limit": limit, "allowed_updates": json.dumps(["message", "channel_post"])}

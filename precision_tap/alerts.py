@@ -203,9 +203,10 @@ def render_lines(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) -> Li
 def render_message(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params,
                    *, parse_mode: str = "HTML") -> str:
     lines = render_lines(ev, ctx, cfg, params)
-    if parse_mode == "plain":
+    mode = str(parse_mode or "HTML").strip().upper()
+    if mode == "PLAIN":
         return "\n".join(lines)
-    if parse_mode == "MARKDOWNV2":
+    if mode in ("MARKDOWNV2", "MARKDOWN"):
         return "\n".join(escape_markdownv2(ln) for ln in lines)
     out: List[str] = []
     for i, ln in enumerate(lines):
@@ -233,9 +234,10 @@ def tradingview_symbol(symbol: str, exchange: str = "") -> Tuple[str, str]:
 
 def build_buttons(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig) -> Dict[str, Any]:
     exch, tv_sym = tradingview_symbol(ev.symbol, str(ctx.get("exchange") or cfg.default_exchange))
-    sym = tv_sym
     tv = cfg.link_template.format(exchange=exch, symbol=tv_sym, yf_symbol=ev.symbol)
-    quote = f"https://finance.yahoo.com/quote/{sym}"
+    # TradingView wants the bare symbol (NSE:TCS) but Yahoo needs the suffixed
+    # one — /quote/TCS resolves to a US listing, not the NSE stock.
+    quote = f"https://finance.yahoo.com/quote/{ev.symbol}"
     return {"inline_keyboard": [[{"text": "📈 Chart", "url": tv},
                                  {"text": "🔎 Quote", "url": quote}]]}
 

@@ -106,10 +106,16 @@ jobs:
 
       - name: Inspect restored ledger
         run: |
-          if [ "${{ steps.state.outputs.cache-hit }}" != "true" ]; then
+          # NOTE: `cache-hit` is only true on an *exact* key match, which this
+          # workflow never produces (each run saves under its own run id) — the
+          # restore always arrives via `restore-keys`.  Checking `cache-hit`
+          # here warned on every single run even when the ledger was restored.
+          # `cache-matched-key` is the honest signal, plus the file itself.
+          if [ -z "${{ steps.state.outputs.cache-matched-key }}" ] || [ ! -f data/state.sqlite3 ]; then
             echo "::warning::No prior ledger restored — empty dedupe set, so alerts already sent today may be re-delivered once."
             exit 0
           fi
+          echo "ledger restored via ${{ steps.state.outputs.cache-matched-key }}"
           python - <<'PY'
           import sqlite3
           try:
@@ -138,28 +144,23 @@ jobs:
           fi
           echo "Telegram token and chat id present"
 
-      # getMe authenticates the token without sending anything.  A "starting"
-      # ping here would mean ~29 messages a day of pure noise.
-      - name: Verify bot token (getMe)
+      # getMe authenticates the token and getChat validates every chat id — all
+      # without sending anything (a "starting" ping here would mean ~29 messages
+      # a day of pure noise).  getMe alone is NOT enough: a mistyped chat id, a
+      # bot that was never started, or a bot missing from the group all pass
+      # getMe and then eat every alert at send time while the run stays green.
+      - name: Verify bot token + chat id (no message sent)
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         run: |
-          python - <<'PY'
-          import sys
-          from precision_tap.config import load_config
-          from precision_tap.telegram import TelegramClient
-          cfg = load_config()
-          try:
-              me = TelegramClient(cfg.telegram).get_me()
-          except Exception as exc:
-              print(f"::error::getMe failed — is TELEGRAM_BOT_TOKEN valid? {exc}")
-              sys.exit(1)
-          print(f"bot @{me.get('username')} reachable · chat(s) {cfg.telegram.chat_ids}")
-          PY
+          python -m precision_tap telegram-test --validate-only
 
       # ── the scan ────────────────────────────────────────────────────────────
       # No --live/--eod: `scan` asks _market_open and rebuilds today's bar from
       # 5m ticks during the session, settled bars after it.  --retried drains
       # whatever a previous cycle queued behind a Telegram outage.
+      # Exit codes: 0 ok (a quiet market is ok), 3 nothing usable (feed dead),
+      # 4 signals found but not delivered (Telegram broken) — the last two fail
+      # the job so a broken pipeline can never look like a quiet market again.
       - name: Run live scan (yfinance → Telegram)
         id: scan
         run: |
@@ -200,6 +201,44 @@ jobs:
           set -e
           echo "::endgroup::"
           exit "$rc"
+
+      # ── what just happened, in one glance ────────────────────────────────────
+      # The run's green/red already reflects pipeline health (the scan step fails
+      # on feed-dead and on undelivered alerts), but "success + silence" still
+      # needs one line saying *why*: quiet market, or filtered everything.
+      - name: Summarise scan result
+        if: always()
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import glob, json, os
+          files = sorted(glob.glob("results/scan_*.json"))
+          if not files:
+              print("## Precision Tap — no scan report produced")
+              print("The scan step never wrote `results/scan_*.json` — read the step log above.")
+              raise SystemExit
+          rep = json.load(open(files[-1]))
+          n_alerts = len(rep.get("alerts", []))
+          kinds = {}
+          for a in rep.get("alerts", []):
+              kinds[a["event"]] = kinds.get(a["event"], 0) + 1
+          acc = " · ".join(f"{k} {v}" for k, v in sorted(kinds.items())) or "—"
+          print(f"## Precision Tap — {rep.get('mode', '?')} scan")
+          print(f"**universe** {rep.get('universe')} · **usable** {rep.get('usable')} · "
+                f"**errors** {rep.get('errors')} · **with zones** {rep.get('symbols_with_zones')}")
+          print(f"**events in window** {rep.get('events_in_window')} · "
+                f"**filtered** {rep.get('filtered')} · **skipped symbols** {rep.get('skipped_symbols')}")
+          print(f"**alerts** {n_alerts} ({acc}) · **delivery** `{rep.get('delivery') or '—'}`")
+          show = [n for n in rep.get("notes", []) if n.startswith(
+              ("FEED PROBLEM", "DELIVERY PROBLEM", "NOT SENT", "no usable symbols",
+               "nothing to send", "also filtered"))]
+          for n in show[:6]:
+              print(f"- {n}")
+          if n_alerts:
+              print("")
+              for a in rep.get("alerts", [])[:15]:
+                  print(f"- `{a['symbol']}` **{a['event']}** @ {a.get('level')} "
+                        f"(stop {a.get('stop')}) · {a.get('date')}")
+          PY
 
       # ── end-of-day digest ───────────────────────────────────────────────────
       # "Silence ≠ no signals": the 17:00 IST cycle posts what happened, so a

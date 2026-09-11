@@ -136,6 +136,18 @@ class LiveLoop:
             if due <= now:
                 due += timedelta(days=1)
             cand.append(max(20.0, (due - now).total_seconds()))
+        hb = str(live.heartbeat_daily_time or "").strip()
+        if self.heartbeat and hb:
+            parsed = _parse_hm(hb)
+            if parsed is not None:
+                # The heartbeat used to be checked only when some *other* wake
+                # fired, so with scans at 15:35/16:10 a 15:45 heartbeat went out
+                # after 17:10.  Waking for it keeps "the loop is alive" on time.
+                hh, mm = parsed
+                due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if due <= now:
+                    due += timedelta(days=1)
+                cand.append(max(20.0, (due - now).total_seconds()))
         if not cand:
             cand = [30 * 60.0]
         return float(min(min(cand), 3600.0))
@@ -178,8 +190,8 @@ class LiveLoop:
         log.info("live loop stopped after %d cycle(s)", self._cycles)
         return 0
 
-    def _scan(self, tag: str) -> None:
-        """Run one cycle.
+    def _scan(self, tag: str):
+        """Run one cycle. Returns the :class:`ScanReport` (or ``None`` on crash).
 
         The mode follows the **market**, not the trigger: a scan scheduled for
         11:30 or 13:30 lands squarely inside the session, and running it in
@@ -204,7 +216,7 @@ class LiveLoop:
                     self.store.finish_run(0, note=f"cycle {tag} failed: {exc}"[:200])
                 except Exception:
                     pass
-            return
+            return None
         try:
             self.scanner.dispatcher.retry_pending()
         except Exception as exc:
@@ -226,13 +238,15 @@ class LiveLoop:
         else:
             log.info("cycle %s → nothing to send", tag)
         for note in rep.notes:
-            if note.startswith(("DELIVERY PROBLEM", "NOT SENT", "nothing to send")):
+            if note.startswith(("DELIVERY PROBLEM", "NOT SENT", "FEED PROBLEM",
+                                "no usable symbols", "nothing to send")):
                 log.warning("cycle %s: %s", tag, note)
         if self.on_scan is not None:
             try:
                 self.on_scan(rep)
             except Exception:
                 log.debug("on_scan hook failed", exc_info=True)
+        return rep
 
     def _send_heartbeat(self, now: datetime) -> None:
         if not self.heartbeat or self.scanner.telegram is None:
