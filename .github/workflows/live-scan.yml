@@ -65,7 +65,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   TZ: Asia/Kolkata          # readable log stamps; the scanner is tz-aware regardless
@@ -214,6 +214,14 @@ jobs:
           echo "::endgroup::"
           exit "$rc"
 
+      # ── TEMPORARY diagnostics (removed with the fix) ─────────────────────────
+      - name: Run real-feed diagnostics
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        continue-on-error: true
+        run: |
+          python -m precision_tap doctor --net 2>&1 | tee diag-doctor.txt || true
+          python tools/diag_scan.py 2>&1 | tee diag-scan.txt || true
+
       # ── what just happened, in one glance ────────────────────────────────────
       # The run's green/red already reflects pipeline health (the scan step fails
       # on feed-dead and on undelivered alerts), but "success + silence" still
@@ -343,3 +351,16 @@ jobs:
           run <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">#${{ github.run_number }}</a> · ${{ github.event_name }}
           check the workflow log for the traceback."
 
+
+      # ── TEMPORARY: publish diagnostics to this branch (removed with the fix) ─
+      - name: Publish diagnostics to branch
+        if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+        run: |
+          git config user.name "diag-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p diag
+          for f in diag-doctor.txt diag-scan.txt diag-report.md; do cp "$f" diag/ 2>/dev/null || true; done
+          git add -f diag
+          git commit -m "diag: real-feed scan report (auto) [skip ci]" || echo "nothing to commit"
+          git pull --rebase origin "${{ github.ref_name }}" || true
+          git push origin HEAD:"${{ github.ref_name }}" || echo "push failed"
