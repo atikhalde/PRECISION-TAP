@@ -589,3 +589,26 @@ def test_non_tap_alerts_quote_the_live_pre_order():
            "exchange": "NSE", "timeframe": "1d", "entry": z.entry}
     text = render_message(ev, ctx, AlertConfig(), Params.default(), parse_mode="plain")
     assert "100.60" in text, text
+
+
+def test_a_quiet_cycle_says_why_nothing_was_sent(monkeypatch):
+    """"Why did nothing fire?" is the first question after an empty cycle, so
+    the report must carry the filter tally instead of a bare `alerts matched: 0`."""
+    patch_source(monkeypatch)
+    cfg = scan_cfg(alert={"recent_bars": 3})
+    cfg.alert.min_liquidity_dollar_volume = 9e18        # nothing can pass
+    sc = Scanner(cfg, store=None, dry_run=True)
+    rep = sc.scan(live=True, progress=False)
+    sc.close()
+    assert rep.alerts == []
+    assert any(n.startswith("nothing to send") and "illiquid" in n for n in rep.notes), rep.notes
+
+
+def test_exchange_label_maps_provider_codes():
+    from precision_tap.scanner import exchange_label
+    # Yahoo reports the NSE as "NSI"; the alert should read NSE
+    assert exchange_label("NSI") == "NSE"
+    assert exchange_label("nse") == "NSE"
+    assert exchange_label("BOM") == "BSE"
+    assert exchange_label("NASDAQ") == "NASDAQ"      # unknown codes pass through
+    assert exchange_label(None) == ""

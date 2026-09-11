@@ -263,6 +263,7 @@ tools/mock_telegram_server.py   ← local stand-in for api.telegram.org
 |---|---|
 | `Telegram not configured` | `.env` needs `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; check `python -m precision_tap telegram-test` |
 | No alerts at all, ever | the gates are strict by design: try `--set indicator.min_rvol=1.4 --set indicator.min_clv=0.65`, and check `alerts.min_liquidity_dollar_volume`/`min_price`; `verify SYM` shows what the engine sees |
+| `alerts matched: 0` but zones are found | read the `nothing to send — …` note at the end of the cycle: it tallies *why* every event was dropped (`illiquid 12 · event type disabled 6`). A quiet market plus a ₹500 crore turnover floor plus `tap1`-only often filters everything; `--min-dollar-volume 100` or `--events tap1,approach,confirmed,tap` widens it |
 | `scan --no-send` shows alerts but `run` sends nothing | `.env` is missing/unreadable, so `run` falls back to log-only. It says so once at startup and on every cycle; `doctor` prints the token/chat status |
 | Cycle runs every 10 min but the notes say `skipped` | the feed's newest bar is not a recent session (`skip_stale_bars`). Check `data.provider`, the yfinance version, and `doctor --net` |
 | Alerts repeat yesterday's session | the intraday rebuild failed, so today's bar is missing; the stale guard then suppresses it. Check `data.live_intraday_bar` / `data.intraday_interval` |
