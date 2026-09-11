@@ -75,28 +75,22 @@ jobs:
               print("history(progress=…, threads=…) -> TypeError:", exc)
           PY
 
-      - name: 1 · what the engine sees on today's bar (verbose, not sent)
+      - name: 1 · live cycle → Telegram (real alerts, charts, ₹100cr floor)
         continue-on-error: true
         run: |
-          python -m precision_tap scan --no-send --no-charts -v --recent-bars 3 \
+          python -m precision_tap scan --messages --recent-bars 3 \
             --events tap1,approach,confirmed,tap \
-            --set data.cache_max_age_minutes=0 --set data.eod_cache_max_age_minutes=0 \
-            2>&1 | grep -E "skip |alerts matched|mode=|delivery|^  [A-Z0-9.&-]+\.NS " | head -60 \
-            | tee probe.txt
-
-      - name: 2 · deliver whatever the live market produced
-        continue-on-error: true
-        run: |
-          python -m precision_tap scan --no-charts --messages --recent-bars 3 \
-            --events tap1,approach,confirmed,tap \
+            --min-dollar-volume 100 \
             --set alerts.daily_limit=5 \
             --set data.cache_max_age_minutes=0 --set data.eod_cache_max_age_minutes=0 \
-            2>&1 | tail -60 | tee live.txt
+            2>&1 | tee probe.txt
 
-      - name: 3 · feed probe
+      - name: 2 · the same universe with the SHIPPED defaults (₹500cr, tap1 only)
         continue-on-error: true
         run: |
-          python -m precision_tap doctor --net 2>&1 | tail -8 | tee doctor.txt
+          python -m precision_tap scan --no-send --no-charts \
+            --set data.cache_max_age_minutes=0 --set data.eod_cache_max_age_minutes=0 \
+            2>&1 | tail -12 | tee doctor.txt
 
       - name: Report back to the PR
         if: always()
@@ -108,13 +102,12 @@ jobs:
             echo ""
             echo "runner \`ubuntu-latest\` · ref \`${{ github.ref_name }}\` · commit \`${GITHUB_SHA::7}\`"
             echo ""
-            for part in env probe live doctor before; do
+            for part in env probe doctor; do
               case "$part" in
                 env)       title="0 · environment (versions on the runner)";;
                 probe)     title="1 · probe, fixed code (<code>scan --no-send</code>)";;
                 live)      title="2 · live cycle, fixed code — DELIVERED to Telegram";;
-                doctor)    title="3 · feed probe (<code>doctor --net</code>)";;
-                before)    title="4 · the same cycle with the pre-fix <code>data.py</code>, cold cache";;
+                doctor)    title="2 · the shipped defaults on the same bars (not sent)";;
               esac
               echo "<details><summary>$title</summary>"
               echo ""
@@ -134,7 +127,5 @@ jobs:
           path: |
             env.txt
             probe.txt
-            live.txt
             doctor.txt
-            before.txt
           if-no-files-found: ignore
