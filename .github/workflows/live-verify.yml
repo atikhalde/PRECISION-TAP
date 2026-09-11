@@ -1,0 +1,117 @@
+# TEMPORARY — one-shot live-market verification for PR #5.
+#
+# Runs the scanner against the *real* market on a GitHub runner (this sandbox has
+# no route to Yahoo/Telegram) and posts the console output back to the PR, so the
+# fix can be verified where it matters:
+#
+#   1. probe   — fixed code,   --no-send   (proves the provider returns bars)
+#   2. live    — fixed code,   real send   (proves delivery to Telegram)
+#   3. before  — data.py from the pre-fix commit, same runner, same yfinance
+#
+# Deleted once the run has been inspected.
+name: Live verify (temporary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbols:
+        description: "Universe for the verification run"
+        required: false
+        default: "RELIANCE,TCS,INFY,HDFCBANK,SBIN,ICICIBANK"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TZ: Asia/Kolkata
+  PYTHONUNBUFFERED: "1"
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  BASE_SHA: 8bd147b22db469edc9cf9cba6fb61389b17c76cc   # pre-fix main
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -c "import yfinance, pandas; print('yfinance', yfinance.__version__, '| pandas', pandas.__version__)"
+
+      - name: 1 · probe with the FIXED code (no alerts sent)
+        continue-on-error: true
+        run: |
+          python -m precision_tap scan --no-send --messages --no-charts \
+            -S ${{ inputs.symbols }} 2>&1 | tee probe.txt
+          echo "exit=${PIPESTATUS[0]}"
+
+      - name: 2 · live cycle with the FIXED code (delivers to Telegram)
+        id: live
+        continue-on-error: true
+        run: |
+          python -m precision_tap scan --no-charts -S ${{ inputs.symbols }} 2>&1 | tee live.txt
+          echo "exit=${PIPESTATUS[0]}"
+
+      - name: 3 · the same probe against the PRE-FIX data.py
+        continue-on-error: true
+        run: |
+          git fetch --depth 1 origin "$BASE_SHA" || true
+          git show "$BASE_SHA:precision_tap/data.py" > precision_tap/data.py
+          python -m precision_tap scan --no-send --no-charts \
+            -S ${{ inputs.symbols }} 2>&1 | tee before.txt
+          echo "exit=${PIPESTATUS[0]}"
+          git checkout -- precision_tap/data.py
+
+      - name: Report back to the PR
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## Live-market verification · $(date -u +'%Y-%m-%d %H:%M UTC')"
+            echo ""
+            echo "runner: ubuntu-latest · event \`${{ github.event_name }}\` · ref \`${{ github.ref_name }}\`"
+            echo ""
+            echo "<details><summary>1 · probe, fixed code (<code>scan --no-send</code>)</summary>"
+            echo ""
+            echo '```'
+            cat probe.txt 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo "</details>"
+            echo ""
+            echo "<details><summary>2 · live cycle, fixed code (delivered to Telegram)</summary>"
+            echo ""
+            echo '```'
+            cat live.txt 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo "</details>"
+            echo ""
+            echo "<details><summary>3 · the same probe with the pre-fix <code>data.py</code></summary>"
+            echo ""
+            echo '```'
+            cat before.txt 2>/dev/null || echo "(no output)"
+            echo '```'
+            echo "</details>"
+          } > comment.md
+          gh pr comment 5 --body-file comment.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-verify-${{ github.run_number }}
+          path: |
+            probe.txt
+            live.txt
+            before.txt
+          if-no-files-found: ignore
