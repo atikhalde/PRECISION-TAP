@@ -54,13 +54,19 @@ BANNER = "Precision Tap — NSE/BSE daily scanner & backtester (Pine port)"
 def _cfg(args) -> Any:
     cfg = load_config(args.config, overrides=args.set or (), env_path=args.env_file)
     if getattr(args, "symbols", None):
-        cfg.data.universe = [s for s in args.symbols if s]
+        # normalise through the universe reader, so `-S RELIANCE` yields the same
+        # ticker — and therefore the same alert links and de-duplication keys —
+        # as the universe file does
+        cfg.data.universe = read_universe(text=",".join(s for s in args.symbols if s),
+                                         suffix=cfg.data.symbol_suffix)
     if getattr(args, "days", None):
         cfg.data.lookback_days = int(args.days)
     if getattr(args, "provider", None):
         cfg.data.provider = args.provider
     if getattr(args, "limit", None):
-        cfg.data.universe = (cfg.data.universe or read_universe(cfg.data.universe_file))[: args.limit]
+        cfg.data.universe = (cfg.data.universe
+                             or read_universe(cfg.data.universe_file,
+                                              suffix=cfg.data.symbol_suffix))[: args.limit]
     for flag, attr in (("trigger", "entry_trigger"), ("target_r", "target_r"),
                         ("stop_mode", "stop_mode"), ("trail", "trail_mode"),
                         ("time_stop", "time_stop_bars"), ("risk", "risk_per_trade"),
@@ -256,6 +262,31 @@ def cmd_verify(args) -> int:
     return 0
 
 
+def _undelivered_exit(rep, cfg, *, explicit_dry: bool, label: str) -> tuple[int, str]:
+    """Exit code + message for a cycle that found alerts the chat never saw.
+
+    ``0`` (quiet/green) is reserved for the two honest silent outcomes: nothing
+    was found, or the caller *asked* not to send (``--no-send``, ``--report-only``,
+    ``alerts.quiet_log_only``).  Anything else — a rejected send, or a cycle that
+    found signals with no transport to carry them — is a broken pipeline, and a
+    scheduler that stays green there is indistinguishable from a dead scanner.
+    """
+    d = rep.dispatch
+    if d is None or isinstance(d, dict):
+        return 0, ""
+    if getattr(d, "undelivered", 0):
+        return 4, (f"{label} FAILED: {d.undelivered} alert(s) found but NOT delivered — {d}"
+                   "\n  Telegram rejected the send (bad token, chat not found, bot blocked) "
+                   "or was unreachable. Run `python -m precision_tap telegram-test` and, "
+                   "if needed, `livecheck`.")
+    if not explicit_dry and getattr(d, "log_only", 0):
+        return 4, (f"{label} FAILED: {d.log_only} alert(s) found but nothing could send them "
+                   f"— {d}\n  telegram.enabled / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not "
+                   "usable here (cron and systemd need the env file — see deploy/README.md). "
+                   "The alerts were logged and marked given-up, not delivered.")
+    return 0, ""
+
+
 def cmd_scan(args) -> int:
     cfg = _cfg(args)
     # same contract as `run`: with no working transport, log the alerts instead
@@ -313,11 +344,13 @@ def cmd_scan(args) -> int:
                   f"(feed outage or provider misconfiguration; see the notes above)",
                   file=sys.stderr)
             return 3
-        d = rep.dispatch
-        if d is not None and not isinstance(d, dict) and getattr(d, "undelivered", 0):
-            print(f"\nSCAN FAILED: {d.undelivered} alert(s) found but NOT delivered — {d}",
-                  file=sys.stderr)
-            return 4
+        rc, msg = _undelivered_exit(
+            rep, cfg,
+            explicit_dry=bool(args.no_send or args.report_only or cfg.alert.quiet_log_only),
+            label="SCAN")
+        if rc:
+            print("\n" + msg, file=sys.stderr)
+            return rc
     return 0
 
 
@@ -350,11 +383,13 @@ def cmd_run(args) -> int:
                     print(f"RUN FAILED: 0/{rep.universe} symbols usable "
                           f"(errors={rep.errors} skipped={rep.skipped_symbols})", file=sys.stderr)
                     return 3
-                d = rep.dispatch
-                if d is not None and not isinstance(d, dict) and getattr(d, "undelivered", 0):
-                    print(f"RUN FAILED: {d.undelivered} alert(s) NOT delivered — {d}",
-                          file=sys.stderr)
-                    return 4
+                rc, msg = _undelivered_exit(
+                    rep, cfg,
+                    explicit_dry=bool(args.no_send or cfg.alert.quiet_log_only),
+                    label="RUN")
+                if rc:
+                    print(msg, file=sys.stderr)
+                    return rc
                 return 0
             return loop.run()
         finally:

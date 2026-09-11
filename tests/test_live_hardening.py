@@ -484,3 +484,52 @@ def test_fully_skipped_live_cycle_names_the_cause(monkeypatch, tmp_path):
         sc.close()
     assert rep.usable == 0
     assert any(n.startswith("no usable symbols") for n in rep.notes), rep.notes
+
+
+def test_yfinance_transient_typeerror_is_retried(fake_yf, tmp_path, monkeypatch):
+    """A TypeError from inside yfinance is a hiccup, not a signature problem.
+
+    ``Ticker.history`` walks ``_get_ticker_tz`` → ``self.info`` first, and when
+    that metadata request comes back empty yfinance raises
+    ``TypeError: argument of type 'NoneType' is not iterable``.  Treating every
+    TypeError as "this build rejects the kwarg" skipped the retry *and* the
+    backoff for every symbol in the universe, so one flappy minute zeroed a whole
+    cycle.  Only the ``unexpected keyword argument`` shape is permanent (and the
+    ``_history`` shim heals even that).
+    """
+    src = _src(tmp_path, retry_max=3, retry_backoff=0.01)
+    tk = FakeTicker("RELIANCE.NS")
+    calls = {"n": 0}
+    real_history = FakeTicker.history
+
+    def no_info_yet(self, **kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise TypeError("argument of type 'NoneType' is not iterable")
+        return real_history(self, **kw)
+
+    monkeypatch.setattr(FakeTicker, "history", no_info_yet)
+    out = src._yfinance_history(tk, {"period": "1d", "interval": "1d"}, what="test")
+    assert out is not None and len(out) > 0
+    assert calls["n"] == 3, calls
+
+
+def test_whole_universe_survives_a_flaky_yfinance_metadata_path(fake_yf, tmp_path, monkeypatch):
+    """…and the cycle still scans, instead of reporting every symbol as broken."""
+    from precision_tap.data import Bars
+    import precision_tap.data as D
+
+    src = _src(tmp_path, retry_max=3, retry_backoff=0.01, min_bars=50)
+    state = {"n": 0}
+    real = FakeTicker.history
+
+    def flaky(self, **kw):
+        state["n"] += 1
+        if state["n"] <= 2:                       # fails twice, then recovers
+            raise TypeError("argument of type 'NoneType' is not iterable")
+        return real(self, **kw)
+
+    monkeypatch.setattr(FakeTicker, "history", flaky)
+    bars = src.get("RELIANCE.NS", use_cache=False)
+    assert bars.ok, bars.error
+    assert state["n"] >= 3

@@ -65,7 +65,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   TZ: Asia/Kolkata          # readable log stamps; the scanner is tz-aware regardless
@@ -168,6 +168,9 @@ jobs:
       # Exit codes: 0 ok (a quiet market is ok), 3 nothing usable (feed dead),
       # 4 signals found but not delivered (Telegram broken) — the last two fail
       # the job so a broken pipeline can never look like a quiet market again.
+      # 4 now covers both shapes of "found but never delivered": a rejection at
+      # send time, and a cycle with nothing to send with at all (`log-only=N` —
+      # e.g. the secret never reached the process), which used to exit 0.
       - name: Run live scan (yfinance → Telegram)
         id: scan
         run: |
@@ -213,14 +216,6 @@ jobs:
           set -e
           echo "::endgroup::"
           exit "$rc"
-
-      # ── TEMPORARY diagnostics (removed with the fix) ─────────────────────────
-      - name: Run real-feed diagnostics
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        continue-on-error: true
-        run: |
-          python -m precision_tap doctor --net 2>&1 | tee diag-doctor.txt || true
-          python tools/diag_scan.py 2>&1 | tee diag-scan.txt || true
 
       # ── what just happened, in one glance ────────────────────────────────────
       # The run's green/red already reflects pipeline health (the scan step fails
@@ -350,17 +345,3 @@ jobs:
           python -m precision_tap telegram-test --text "⚠️ <b>Precision Tap live scan failed</b>
           run <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">#${{ github.run_number }}</a> · ${{ github.event_name }}
           check the workflow log for the traceback."
-
-
-      # ── TEMPORARY: publish diagnostics to this branch (removed with the fix) ─
-      - name: Publish diagnostics to branch
-        if: ${{ always() && github.event_name == 'workflow_dispatch' }}
-        run: |
-          git config user.name "diag-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          mkdir -p diag
-          for f in diag-doctor.txt diag-scan.txt diag-report.md; do cp "$f" diag/ 2>/dev/null || true; done
-          git add -f diag
-          git commit -m "diag: real-feed scan report (auto) [skip ci]" || echo "nothing to commit"
-          git pull --rebase origin "${{ github.ref_name }}" || true
-          git push origin HEAD:"${{ github.ref_name }}" || echo "push failed"

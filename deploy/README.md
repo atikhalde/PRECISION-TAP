@@ -44,6 +44,12 @@ Backtest from the same image: `docker compose run --rm precision-tap python -m p
 the default for a single invocation. Prefer the `15:35`/`16:10` IST jobs if you only want the
 indicator-exact closed-bar alert set; add the `*/15` intraday jobs for live touch alerts.
 
+Cron gives the job no environment, so `deploy/cron.example` sets `PRECISION_TAP_ENV_FILE=/etc/precision-tap.env`
+and the scanner loads the secrets from that file itself. If it is missing, the run does not fail quietly any
+more: `scan` exits **4** with `alerts found but nothing could send them`. Check with
+`sudo -u precision env -i /opt/precision-tap/.venv/bin/python -m precision_tap telegram-test` (that is exactly
+the empty environment cron runs in) and `grep -c 'alert (log-only)' logs/cron.log`.
+
 ## GitHub Actions (no server)
 
 `.github/workflows/live-scan.yml` runs the scanner on GitHub's runners against the live market and

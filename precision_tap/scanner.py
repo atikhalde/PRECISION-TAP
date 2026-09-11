@@ -375,6 +375,21 @@ class Scanner:
                 rep.notes.append(f"DELIVERY PROBLEM — {d}")
                 log.error("cycle found %d alert(s) but %d did not reach Telegram: %s",
                           len(items), d.undelivered, detail or d)
+            elif getattr(d, "log_only", 0):
+                # Every one of these alerts was found, rendered and then dropped
+                # on the floor because nothing could carry it.  "the chat is
+                # silent and every run is green" is always this line, so name the
+                # reason instead of leaving it to be guessed.
+                why = ("alerts.quiet_log_only is on" if cfg.alert.quiet_log_only
+                       else "telegram.enabled is false" if not cfg.telegram.enabled
+                       else "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are not set"
+                       if not (cfg.telegram.bot_token and cfg.telegram.chat_ids)
+                       else "the Telegram client is in dry-run mode")
+                rep.notes.append(f"NOT SENT — {d}; {why}. Fix it (.env / config.yaml → "
+                                 "telegram), then `python -m precision_tap telegram-test` "
+                                 "to prove the chat receives messages")
+                log.error("cycle found %d alert(s) but NO transport could deliver them (%s)",
+                          len(items), why)
             elif not self.dispatcher.deliverable:
                 rep.notes.append(f"NOT SENT — no working Telegram transport ({d}); "
                                  "set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env")

@@ -4,6 +4,7 @@ Regression cover for the "scanner is green but scans nothing" failure class:
 a preset whose every download source fails used to return an empty list, which
 the scanner then happily "scanned" (0 symbols, exit 0, no alerts, no diagnosis).
 """
+from pathlib import Path
 from unittest.mock import patch
 
 import pandas as pd
@@ -13,6 +14,8 @@ from precision_tap.data import (PRESET_SOURCES, _http_symbols, read_universe,
                                 resolve_preset)
 from precision_tap.params import ScanConfig
 from precision_tap.scanner import Scanner
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 # ── source chain ─────────────────────────────────────────────────────────────
@@ -126,3 +129,38 @@ def test_cmd_scan_exits_2_on_empty_universe(capsys, tmp_path):
         rc = main(["scan", "-c", str(cfg_file), "--no-send"])
     assert rc == 2
     assert "resolved to 0 symbols" in capsys.readouterr().err
+
+
+# ── CLI universe overrides ───────────────────────────────────────────────────
+def test_cli_symbols_are_normalised_like_the_universe_file():
+    """``-S reliance`` must produce ``RELIANCE.NS``, exactly as the file does.
+
+    An unsuffixed universe still *fetches* (the provider adds the suffix), but
+    every downstream identity changes: the Yahoo quote button points at a US
+    listing, ``data.market: BSE`` scans ``.NS`` tickers, and the de-duplication
+    keys differ from the file's, so the same signal alerts twice.
+    """
+    from types import SimpleNamespace
+
+    from precision_tap.cli import _cfg
+
+    def args(**kw):
+        base = dict(config=None, set=[], env_file=None, symbols=None, days=None,
+                    provider=None, limit=0, events=None, recent_bars=None,
+                    no_charts=False, min_dollar_volume=None, trigger=None, target_r=None,
+                    stop_mode=None, trail=None, time_stop=None, risk=None, capital=None,
+                    max_positions=None)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    uni_file = str(ROOT / "universe" / "nse.txt")
+    cfg = _cfg(args(symbols=["reliance", "TCS.NS", "^NSEI"],
+                    set=[f"data.universe_file={uni_file}"]))
+    assert cfg.data.universe == ["RELIANCE.NS", "TCS.NS", "^NSEI"]
+
+    bse = _cfg(args(symbols=["RELIANCE"], set=["data.symbol_suffix=.BO"]))
+    assert bse.data.universe == ["RELIANCE.BO"]
+
+    lim = _cfg(args(limit=3, set=[f"data.universe_file={uni_file}"]))
+    assert len(lim.data.universe) == 3
+    assert all(s.endswith(".NS") for s in lim.data.universe), lim.data.universe

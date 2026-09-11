@@ -13,7 +13,14 @@ from .params import AlertConfig, DataConfig, LiveConfig, Params, ScanConfig, Tel
 
 log = logging.getLogger("precision_tap.config")
 
-ENV_FILE_CANDIDATES = (".env", "config/.env")
+#: Secrets files probed, in order.  ``/etc/precision-tap.env`` is the location the
+#: deployment docs use for the systemd ``EnvironmentFile`` — and the only way a
+#: cron job (or a bare ``python -m precision_tap scan`` in a shell that never
+#: exported the secrets) sees them at all.  Without it the same host scans
+#: "successfully" while every alert is logged and dropped, because
+#: ``TELEGRAM_BOT_TOKEN`` was never in the process environment.
+#: ``PRECISION_TAP_ENV_FILE`` overrides the list entirely.
+ENV_FILE_CANDIDATES = (".env", "config/.env", "/etc/precision-tap.env")
 _SECRET_RE = re.compile(r"\$\{([A-Z0-9_]+)(?::([^}]*))?\}")
 
 
@@ -23,10 +30,21 @@ _SECRET_RE = re.compile(r"\$\{([A-Z0-9_]+)(?::([^}]*))?\}")
 
 def load_dotenv(path: Optional[str] = None, *, override: bool = False) -> List[str]:
     """Load ``KEY=value`` lines into ``os.environ``. Returns the keys set."""
-    candidates = [Path(path)] if path else [Path(c) for c in ENV_FILE_CANDIDATES]
+    # NB: not named `override` — that is this function's "replace existing env"
+    # keyword, and shadowing it here would silently clobber the process env.
+    wanted = str(os.environ.get("PRECISION_TAP_ENV_FILE", "") or "").strip()
+    if path:
+        candidates = [Path(path)]
+    elif wanted:
+        candidates = [Path(wanted)]
+    else:
+        candidates = [Path(c) for c in ENV_FILE_CANDIDATES]
     loaded: List[str] = []
     for p in candidates:
         if not p or not p.exists():
+            if path or wanted:
+                log.warning("env file %s not found — any secret it should provide "
+                            "is missing", p)
             continue
         for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
             line = raw.strip()
