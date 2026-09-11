@@ -5,7 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=%i
+# NOTE: this is a regular (non-template) unit, so `%i` would expand to an empty
+# string and systemd would refuse to start it — set the real service user here.
+User=precision
 WorkingDirectory=/opt/precision-tap
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/opt/precision-tap

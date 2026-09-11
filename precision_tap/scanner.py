@@ -327,6 +327,20 @@ class Scanner:
         rep.alerts = [(st, ev) for st, ev, _ in items]
         tally = " · ".join(f"{why} {n}" for why, n in
                            sorted(dropped.items(), key=lambda kv: (-kv[1], kv[0])))
+        if rep.usable == 0 and rep.universe > 0:
+            # A whole cycle with nothing usable is never "a quiet market" — say
+            # which of the two possible causes it is, so the log (and the GitHub
+            # step summary) reads as a diagnosis instead of a mystery.
+            # Majority-errors means the provider is failing (outage, ban, bug);
+            # majority-skipped means the fetches *worked* but carry no fresh bar
+            # (NSE holiday, or a feed that has not printed today's session yet).
+            if rep.errors > rep.skipped_symbols:
+                rep.notes.append(f"FEED PROBLEM — {rep.errors}/{rep.universe} symbols failed "
+                                 f"to fetch (see the per-symbol errors above); nothing was evaluated")
+            else:
+                rep.notes.append(f"no usable symbols — {tally or 'every symbol was skipped'}; "
+                                 f"the feed has no fresh bar "
+                                 f"(NSE holiday, or the provider is lagging/down)")
         if not items:
             # "why did nothing fire?" is the first question after every quiet
             # cycle, and silence is indistinguishable from a broken pipeline

@@ -276,6 +276,11 @@ cycle against the live market and prints `RESULT: PASS` or names the first thing
 | Symptom | Fix |
 |---|---|
 | `Telegram not configured` | `.env` needs `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; check `python -m precision_tap telegram-test` |
+| Token set, chat silent, runs are green | `getMe` passing only proves the *token* — validate the chat too: `python -m precision_tap telegram-test --validate-only` (no message sent). A wrong chat id / un-started bot fails here instead of eating alerts |
+| `SCAN FAILED … exit 3` | the feed failed outright (`usable=0`, mostly errors) — provider outage or misconfiguration. A holiday-shaped cycle (fetches ok, no fresh bar) stays green by design |
+| `SCAN FAILED … exit 4` | signals were found but **not** delivered — read the `DELIVERY PROBLEM` note (usually a 400/403 chat problem); fix it and the alerts are re-offered next cycle |
+| `no usable symbols — …` (green) | the feed has no fresh bar — NSE holiday or a lagging vendor. Check the per-symbol notes; the next cycle recovers on its own |
+| `FEED PROBLEM — …` | majority of symbols failed to fetch; the scan exits 3 so schedulers show red. The yfinance→yahoo per-symbol failover (`data.fallback_provider`) already tried |
 | Ran fine, chat is silent, `sent=0 … skipped=N` | you looked at a dry cycle first (`scan --no-send`, or a run with no token). Those alerts are *logged, not delivered*, and the ledger marks them given-up rather than sent — the next cycle with a working bot still sends them. If you are on an older build, `DELETE FROM alerts WHERE sent=2;` in `data/state.sqlite3` clears them |
 | `DELIVERY PROBLEM — … 401 Unauthorized` / `400 chat not found` / `403 bot can't initiate…` | permanent Telegram rejection: the token is wrong, the chat id is wrong, or you never pressed **Start** on the bot (in a group, add it and make it an admin). It is logged at ERROR and *not* retried; fix the credential and the alert is re-offered on the next cycle |
 | `cycle … → delivery sent=0` in the log | the always-on loop now logs the delivery outcome separately from the signal count — a cycle that found three taps and delivered none no longer looks healthy |
