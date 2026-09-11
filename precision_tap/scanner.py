@@ -32,7 +32,7 @@ import pandas as pd
 from .alerts import (AlertDispatcher, build_buttons, dedupe_key, event_name, event_rank,
                      passes_filters, render_message)
 from .chart import render_chart
-from .data import LIVE_PROVIDERS, Bars, DataSource, read_universe
+from .data import LIVE_PROVIDERS, Bars, DataSource, read_universe, session_date
 from .engine import EV_APPROACH, EV_CONFIRMED, EV_INVALID, EV_NEW, EV_TAP, EngineResult, Event, Zone, run_engine
 from .params import AlertConfig, DataConfig, Params, ScanConfig, TelegramConfig
 
@@ -191,6 +191,10 @@ class Scanner:
                                          dry_run=dry_run or self.telegram is None)
 
     def close(self) -> None:
+        try:
+            self.source.close()
+        except Exception:
+            pass
         if self._tg_own and self.telegram is not None:
             try:
                 sess = getattr(self.telegram, "_session", None)
@@ -210,12 +214,26 @@ class Scanner:
 
     # ── one symbol ───────────────────────────────────────────────────────
     def scan_symbol(self, symbol: str, *, live: bool, end: Optional[str] = None) -> SymbolScan:
-        """Fetch + evaluate one symbol (used by tests and ad-hoc `scan --symbol`)."""
+        """Fetch + evaluate one symbol (used by tests and ad-hoc callers).
+
+        A ``Scanner`` can be reused for both an EOD and an intraday check.  The
+        source must be rebuilt (or at least switched) before fetching: otherwise
+        the source created in ``__init__`` remains an EOD source and never asks
+        yfinance/Yahoo for today's forming bar.
+        """
+        requested_live = bool(live and not end)
+        try:
+            self.source.close()
+        except Exception:
+            pass
+        self.source = DataSource(self.cfg.data, live=requested_live)
         bars: Bars = self.source.get(symbol, end=end)
         if not bars.ok:
-            st = SymbolScan(symbol=symbol, error=bars.error or "no data")
-            return st
-        return self._scan_frame(symbol, bars, live=bool(live and bars.live),
+            return SymbolScan(symbol=symbol, error=bars.error or "no data",
+                              source_error=bars.error or "no data")
+        actual_live = bool(requested_live and bars.live)
+        return self._scan_frame(symbol, bars, live=actual_live,
+                                requested_live=requested_live,
                                 historical=bool(end))
 
     # ── full cycle ───────────────────────────────────────────────────────
@@ -228,29 +246,51 @@ class Scanner:
         if live is None:
             live = _market_open(cfg.live.market_timezone, session=(cfg.live.session_open,
                                                                    cfg.live.session_close)) and not end
-        self.source.live = bool(live)
+        requested_live = bool(live and not end)
+        # Keep the scanner's source in sync with the cycle.  The old code used a
+        # throw-away local source here, leaving ``scan_symbol`` and chart/cache
+        # fallbacks on the EOD source created by __init__.  That split could make
+        # the full scan live while a follow-up symbol check silently used stale
+        # daily data.
+        try:
+            self.source.close()
+        except Exception:
+            pass
+        self.source = DataSource(cfg.data, live=requested_live)
         self._frames: Dict[str, pd.DataFrame] = {}
         uni = self.universe(symbols)
         rep = ScanReport(started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                         mode="live" if live and not end else "eod", universe=len(uni))
+                         mode="live" if requested_live else "eod", universe=len(uni))
         run_id = self.store.start_run(rep.mode, len(uni)) if self.store else 0
 
-        src = DataSource(cfg.data, live=bool(live and not end))
-        frames: Dict[str, Bars] = src.get_many(uni, workers=workers or cfg.live.max_workers,
-                                              progress=progress)
+        frames: Dict[str, Bars] = self.source.get_many(uni, workers=workers or cfg.live.max_workers,
+                                                       progress=progress)
         self._frames = {k: v.df for k, v in frames.items() if v.ok}
         items: List[Tuple[SymbolScan, Event, Dict[str, Any]]] = []
         dropped: Dict[str, int] = {}
         for sym in uni:
             b = frames.get(sym)
             if b is None or not b.ok:
+                error = (b.error if b is not None else "provider returned no result") or "no data"
                 rep.errors += 1
+                rep.rows.append(SymbolScan(symbol=sym, error=error, source_error=error))
+                rep.notes.append(f"{sym}: data fetch failed — {error}")
                 continue
-            st = self._scan_frame(sym, b, live=bool(live and not end) and bool(b.live),
+            actual_live = bool(requested_live and b.live)
+            st = self._scan_frame(sym, b, live=actual_live,
+                                  requested_live=requested_live,
                                   historical=bool(end))
             rep.rows.append(st)
             if not st.ok:
                 rep.errors += 1
+                rep.notes.append(f"{sym}: scan skipped — {st.error or 'insufficient data'}")
+                continue
+            # A live-capable provider that did not return today's session is not
+            # allowed to fall back to the last closed bar in a live cycle.  Doing
+            # so produces a plausible-looking alert with yesterday's price — the
+            # exact failure mode behind "the scanner ran but Telegram was quiet".
+            if requested_live and self._tracks_live_market() and not b.live:
+                rep.notes.append(f"{sym}: live bar unavailable (last {st.last_date}) — skipped")
                 continue
             if st.stale and self.cfg.alert.skip_stale_bars:
                 rep.notes.append(f"{sym}: last bar {st.last_date} is not today's session — skipped")
@@ -259,7 +299,7 @@ class Scanner:
             if st.nearest_zone is not None:
                 rep.symbols_with_zones += 1
             rep.events_total += len(st.actionable)
-            for ev in self._recent_events(st, live=live and not end):
+            for ev in self._recent_events(st, live=actual_live):
                 ctx = self._context(st, ev)
                 ok, why = passes_filters(ev, ctx, cfg.alert,
                                          already_seen=(lambda e: self.store.seen(dedupe_key(e, cfg.alert)))
@@ -318,6 +358,7 @@ class Scanner:
         return self.cfg.data.provider in LIVE_PROVIDERS
 
     def _scan_frame(self, symbol: str, bars: Bars, *, live: bool,
+                    requested_live: Optional[bool] = None,
                     historical: bool = False) -> SymbolScan:
         p = self._params_for(symbol)
         st = SymbolScan(symbol=symbol)
@@ -328,9 +369,10 @@ class Scanner:
         st.ok = True
         st.bars = len(df)
         st.live = live
+        requested_live = bool(live) if requested_live is None else bool(requested_live)
         st.stale = (not historical and self._tracks_live_market()
                     and _is_stale_bar(df.index[-1], self.cfg.live.market_timezone,
-                                      strict=bool(live)))
+                                      strict=requested_live))
         res = run_engine(df, p, symbol=symbol, intrabar_last=live, zone_cap=10 ** 6)
         st.result, st.df, st.events = res, df, res.events
         # Closed-bar parity pass.  On the forming bar the engine deliberately
@@ -518,16 +560,8 @@ def _is_stale_bar(bar_ts, tzname: str, *, strict: bool = False) -> bool:
     still reports Friday. Only a feed that has fallen several sessions behind is
     treated as stale (holidays are absorbed by the slack).
     """
-    try:
-        bar = pd.Timestamp(bar_ts)
-        if bar.tzinfo is not None:
-            try:
-                bar = bar.tz_convert(tzname)
-            except Exception:
-                pass
-            bar = bar.tz_localize(None)
-        bday = bar.date()
-    except Exception:
+    bday = session_date(bar_ts, tzname)
+    if bday is None:
         return False
     now = _session_now(tzname).date()
     if bday >= now:                                  # today (or a tz-shifted stamp)
@@ -544,24 +578,13 @@ def _same_session(bar_ts, tzname: str) -> bool:
     """Is the last bar from today's session?  (holiday / stale-feed guard)
 
     Daily bars are date-stamped, so a naive index is read as the exchange session
-    date; a tz-aware one is converted.  Both the exchange-local date and the UTC
-    date are accepted so a UTC-stamped feed at 16:00Z (21:30 IST) is not mistaken
-    for a stale bar.
+    date; a tz-aware one is converted before comparison.  This means a
+    UTC-stamped feed at 16:00Z (21:30 IST) is still recognised as today's session
+    instead of being mistaken for a stale bar.
     """
-    try:
-        from zoneinfo import ZoneInfo
-        dates = {datetime.now(ZoneInfo(tzname)).date()}
-    except Exception:
-        dates = {datetime.now().date()}
-    dates.add(datetime.now(timezone.utc).date())
-    try:
-        bar = pd.Timestamp(bar_ts)
-        if bar.tzinfo is not None:
-            try:
-                bar = bar.tz_convert(tzname)
-            except Exception:
-                pass
-            bar = bar.tz_localize(None)
-        return bar.date() in dates
-    except Exception:
-        return True
+    today = _session_now(tzname).date()
+    bday = session_date(bar_ts, tzname)
+    # If a caller hands us a malformed timestamp, preserve the historical
+    # fail-open behaviour.  The provider itself already rejects empty frames;
+    # this helper is only the final holiday/staleness guard.
+    return bday is None or bday == today

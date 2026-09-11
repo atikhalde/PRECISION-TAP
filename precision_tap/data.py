@@ -87,25 +87,30 @@ def _expected_last_bar_date(tzname: str = DEFAULT_MARKET_TZ, *, live: bool = Fal
     return d
 
 
-def _bar_is_today(ts, meta: dict | None = None) -> bool:
-    """Is this bar stamped with today's session date? (exchange timezone aware)"""
+def session_date(ts: Any, tzname: str = DEFAULT_MARKET_TZ) -> Optional[date_cls]:
+    """Return the exchange-local session date represented by ``ts``.
+
+    Yahoo may stamp a daily bar at midnight in the exchange timezone, at the
+    session open in UTC, or return a timezone-naive date.  Comparing
+    ``Timestamp.date()`` directly is therefore not safe: an NSE bar at 00:00
+    IST is still on the previous UTC calendar day.  Naive timestamps are
+    interpreted as exchange-local, which is the convention used by daily CSV
+    and yfinance frames.
+    """
     try:
-        tz = (meta or {}).get("exchangeTimezoneName")
-        if tz:
-            from zoneinfo import ZoneInfo
-            now = datetime.now(ZoneInfo(tz))
-        else:
-            now = datetime.now()
-        bar = pd.Timestamp(ts)
-        if bar.tzinfo is not None and tz:
-            try:
-                bar = bar.tz_convert(tz)
-            except Exception:
-                pass
-        if bar.date() == now.date():
-            return True
-        # tolerate a UTC-stamped feed (NSE session is 03:45-10:15 UTC)
-        return bar.date() == datetime.now(timezone.utc).date()
+        stamp = pd.Timestamp(ts)
+        if stamp.tzinfo is not None:
+            stamp = stamp.tz_convert(tzname)
+        return stamp.date()
+    except Exception:
+        return None
+
+
+def _bar_is_today(ts, meta: dict | None = None) -> bool:
+    """Is this bar stamped with today's session date in the exchange clock?"""
+    tzname = (meta or {}).get("exchangeTimezoneName") or DEFAULT_MARKET_TZ
+    try:
+        return session_date(ts, tzname) == _now_tz(tzname).date()
     except Exception:
         return False
 
@@ -360,13 +365,24 @@ class Cache:
     """Tiny CSV-on-disk cache; TTL depends on whether the market is open."""
 
     def __init__(self, cfg: DataConfig, *, live: bool = False):
-        self.ttl_min = float(cfg.cache_max_age_minutes if live else cfg.eod_cache_max_age_minutes)
-        self.enabled = self.ttl_min > 0            # 0/negative disables the cache entirely
+        self.cfg = cfg
         self.dir = Path(cfg.cache_dir)
+        self.ttl_min = 0.0
+        self._storage_ok = True
+        self.enabled = False
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
         except Exception:
-            self.enabled = False
+            self._storage_ok = False
+        self.set_scope(live)
+
+    def set_scope(self, live: bool) -> None:
+        """Switch cache freshness rules when a source is reused across modes."""
+        self.ttl_min = float(self.cfg.cache_max_age_minutes if live
+                            else self.cfg.eod_cache_max_age_minutes)
+        # 0/negative deliberately disables caching; this is useful for a forced
+        # live check and prevents a closed-bar frame being reused as a tick frame.
+        self.enabled = self._storage_ok and self.ttl_min > 0
 
     def _path(self, key: str) -> Path:
         safe = re.sub(r"[^A-Za-z0-9._-]", "_", key)
@@ -417,8 +433,9 @@ class DataSource:
 
     def __init__(self, cfg: DataConfig, *, live: bool = False, proxy: str = ""):
         self.cfg = cfg
-        self.live = live
+        self._live = False
         self.cache = Cache(cfg, live=live)
+        self.live = live
         self.limiter = RateLimiter(cfg.rate_limit_per_sec)
         self.proxy = proxy or ""
         self._session = None
@@ -432,6 +449,27 @@ class DataSource:
             except Exception as exc:
                 log.warning("requests unavailable (%s) — falling back to csv/synthetic", exc)
                 self.cfg.provider = "csv"
+
+    @property
+    def live(self) -> bool:
+        return self._live
+
+    @live.setter
+    def live(self, value: bool) -> None:
+        self._live = bool(value)
+        cache = getattr(self, "cache", None)
+        if cache is not None:
+            cache.set_scope(self._live)
+
+    def close(self) -> None:
+        """Close the optional HTTP session held by the provider."""
+        sess = getattr(self, "_session", None)
+        if sess is not None:
+            try:
+                sess.close()
+            except Exception:
+                pass
+            self._session = None
 
     # ── public API ───────────────────────────────────────────────────────
     #: suffixes that are never Indian — rejected so a stray US ticker cannot quietly
@@ -508,13 +546,17 @@ class DataSource:
         return end is None and self.cfg.provider in LIVE_PROVIDERS
 
     def _has_current_bar(self, df: pd.DataFrame) -> bool:
-        """Does the newest row carry the session the feed should already have?"""
+        """Does the newest row carry the session the feed should already have?
+
+        Compare exchange-local dates rather than the raw timestamp.  A Yahoo
+        daily candle can be stamped at 18:30 UTC on the previous calendar day;
+        treating that as stale made the live cache refetch every symbol and, more
+        importantly, could make the scanner evaluate the wrong bar.
+        """
         if df is None or df.empty:
             return False
-        try:
-            return pd.Timestamp(df.index[-1]).date() >= self._expected_date()
-        except Exception:
-            return False
+        last = session_date(df.index[-1], _market_tz(self.cfg.market))
+        return last is not None and last >= self._expected_date()
 
     def _expected_date(self) -> date_cls:
         return _expected_last_bar_date(_market_tz(self.cfg.market), live=bool(self.live))
