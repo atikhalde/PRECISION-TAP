@@ -12,10 +12,12 @@ data:
   interval: 1d                  # daily TF only — the indicator is designed for it
   market: NSE                   # NSE | BSE (label shown in alerts)
   symbol_suffix: ".NS"          # RELIANCE -> RELIANCE.NS ; use ".BO" for BSE
-  universe_file: nifty500          # full broad market: Nifty 500 (falls back to
-                                   # Wikipedia tables when nseindia blocks the host).
-                                   # allnse = every listed equity (~2000, slow);
-                                   # universe/nse.txt = 127-name starter watchlist
+  universe_file: universe/nse.txt  # committed starter watchlist (127 liquid names) —
+                                   # works offline and out of the box, no download.
+                                   # Network presets (need egress at scan time):
+                                   #   nifty50 | nifty100 | nifty200 | nifty500 | allnse
+                                   # nseindia blocks datacenter IPs, so presets fall
+                                   # back to Wikipedia tables when that happens.
   lookback_days: 900            # history per symbol (>= 200 recommended for ATR/volume context)
   min_bars: 150                 # symbols with less history are skipped
   live_intraday_bar: true       # rebuild today's forming bar from 5m ticks (needed for touch alerts)
