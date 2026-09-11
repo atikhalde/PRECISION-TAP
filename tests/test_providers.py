@@ -10,8 +10,23 @@ from precision_tap.data import DataSource, normalize_ohlcv, read_universe, synth
 from precision_tap.params import DataConfig
 
 
+def _last_session():
+    """Most recent weekday in the exchange timezone (today, rolled off weekends)."""
+    d = pd.Timestamp.now(tz="Asia/Kolkata").normalize()
+    while d.weekday() >= 5:
+        d -= pd.Timedelta(days=1)
+    return d
+
+
 def _daily(n=400, seed=5):
-    return synthetic_frame(n=n, seed=seed)
+    """Synthetic history that ends on the most recent session — i.e. a live feed.
+
+    A feed frozen in the past would not exercise any of the freshness logic the
+    live scanner depends on.
+    """
+    df = synthetic_frame(n=n, seed=seed)
+    shift = _last_session().tz_localize(None) - df.index[-1]
+    return df.set_axis(df.index + shift)
 
 
 class FakeTicker:
@@ -29,8 +44,9 @@ class FakeTicker:
         FakeTicker.calls.append(kw)
         df = _daily()
         if kw.get("interval") in ("5m", "1m", "15m") or kw.get("period") == "1d":
-            idx = pd.date_range(df.index[-1].strftime("%Y-%m-%d 09:15"), periods=76, freq="5min",
-                                tz="Asia/Kolkata")
+            # today's forming bar, rebuilt from 5m prints (09:15 -> 15:30)
+            idx = pd.date_range(_last_session() + pd.Timedelta(hours=9, minutes=15),
+                                periods=76, freq="5min", tz="Asia/Kolkata")
             px = df["close"].iloc[-1]
             rng = np.random.default_rng(3)
             c = px * (1 + rng.normal(0, 0.002, len(idx))).cumprod()

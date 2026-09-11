@@ -265,6 +265,21 @@ class AlertDispatcher:
         self.render_charts = render_charts          # callable(ev, ctx) -> png path | None
 
     # ── delivery ─────────────────────────────────────────────────────────
+    @property
+    def deliverable(self) -> bool:
+        """Can this dispatcher actually put a message on Telegram right now?
+
+        Everything else (quiet mode, ``--no-send``, a missing/unconfigured
+        client) degrades to *log-only*: the alert is still rendered, printed and
+        recorded, instead of being dropped into a retry queue that can never
+        drain.
+        """
+        if self.cfg.quiet_log_only or self.dry_run:
+            return False
+        if self.tg is None or not getattr(self.tg, "configured", True):
+            return False
+        return not self.tg.dry_run
+
     def dispatch(self, items: Sequence[Tuple[Event, Dict[str, Any]]]) -> DispatchResult:
         res = DispatchResult()
         ordered = sorted(items, key=lambda ic: (event_rank(ic[0]), ic[0].symbol))
@@ -293,11 +308,15 @@ class AlertDispatcher:
                     photo = self.render_charts(ev, ctx)
                 except Exception as exc:                # a bad chart must never eat a signal
                     log.debug("chart render failed for %s: %s", ev.symbol, exc)
-            if self.cfg.quiet_log_only or self.tg is None:
-                res.queued += 1 if self.tg is None else 0
-                res.skipped += 1 if self.tg is not None else 0
-                log.info("alert (log-only) %s %s", ev.symbol, text.splitlines()[0])
-                res.messages.append({"symbol": ev.symbol, "kind": name, "text": text})
+            if not self.deliverable:
+                res.skipped += 1
+                log.info("alert (log-only) %s %s\n%s", ev.symbol, name, text)
+                res.messages.append({"symbol": ev.symbol, "kind": name, "text": text,
+                                     "ok": False, "why": "no telegram transport"})
+                if self.store is not None:
+                    # recorded above purely for de-duplication — do not leave it
+                    # in the retry queue, there is nothing to retry it with
+                    self.store.give_up([key])
                 continue
             markup = build_buttons(ev, ctx, self.cfg)
             results = []
@@ -326,7 +345,9 @@ class AlertDispatcher:
 
     def retry_pending(self, limit: int = 10) -> int:
         """Re-send alerts that were queued during an outage."""
-        if self.store is None or self.tg is None or self.cfg.quiet_log_only:
+        if self.store is None or self.cfg.quiet_log_only:
+            return 0
+        if not self.deliverable:
             return 0
         sent = 0
         for row in self.store.pending(limit=limit):

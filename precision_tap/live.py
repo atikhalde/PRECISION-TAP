@@ -36,13 +36,24 @@ def _local_now(tzname: str) -> datetime:
         return datetime.now().astimezone()
 
 
-def _parse_hhmm(text: str) -> Tuple[int, int]:
+def _parse_hhmm(text: str) -> Optional[Tuple[int, int]]:
+    """Parse ``"HH:MM"``; return ``None`` for anything malformed.
+
+    Returning ``(0, 0)`` — as this used to — would silently turn a typo in
+    ``live.scan_times`` / ``live.heartbeat_daily_time`` into a job scheduled for
+    midnight, i.e. a scan that fires at the one moment of the day when there is
+    never a fresh bar to look at.
+    """
     try:
         hh, mm = str(text).strip().split(":")
-        return int(hh), int(mm)
+        hh_i, mm_i = int(hh), int(mm)
     except Exception:
         log.warning("ignoring malformed time %r (want HH:MM)", text)
-        return 0, 0
+        return None
+    if not (0 <= hh_i <= 23 and 0 <= mm_i <= 59):
+        log.warning("ignoring out-of-range time %r (want HH:MM)", text)
+        return None
+    return hh_i, mm_i
 
 
 @dataclass
@@ -55,7 +66,7 @@ class LiveLoop:
     on_scan: Optional[Callable[[Any], None]] = None
     stop_after: Optional[float] = None  # monotonic deadline (tests)
     _stop: bool = field(default=False, repr=False)
-    _last_poll: float = field(default=0.0, repr=False)
+    _last_poll: Optional[float] = field(default=None, repr=False)
     _fired: Dict[str, str] = field(default_factory=dict, repr=False)
     _last_day: str = ""
     _cycles: int = 0
@@ -71,7 +82,10 @@ class LiveLoop:
         day_ok = now.strftime("%a").lower()[:3] in {d.lower()[:3] for d in live.trading_days}
         if day_ok:
             for t in (live.scan_times or []):
-                hh, mm = _parse_hhmm(t)
+                parsed = _parse_hhmm(t)
+                if parsed is None:
+                    continue
+                hh, mm = parsed
                 due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
                 tag = f"scheduled@{t}"
                 if now >= due and self._fired.get(tag) != key:
@@ -79,25 +93,45 @@ class LiveLoop:
                     return tag
             if live.intraday_poll_minutes and _market_open(live.market_timezone, now,
                                                             (live.session_open, live.session_close)):
-                if time.monotonic() - self._last_poll >= live.intraday_poll_minutes * 60:
+                if self._poll_due(live.intraday_poll_minutes):
                     return "intraday"
         hb = str(live.heartbeat_daily_time or "").strip()
         if self.heartbeat and hb:
-            hh, mm = _parse_hm(hb)
-            due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-            if now >= due and self._fired.get("heartbeat") != key:
-                self._fired["heartbeat"] = key
-                return "heartbeat"
+            parsed = _parse_hm(hb)
+            if parsed is not None:
+                hh, mm = parsed
+                due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                if now >= due and self._fired.get("heartbeat") != key:
+                    self._fired["heartbeat"] = key
+                    return "heartbeat"
         return None
+
+    def _poll_due(self, minutes: int) -> bool:
+        """Has an intraday poll interval elapsed?
+
+        ``_last_poll`` starts at ``None`` (not ``0.0``): ``time.monotonic()`` has
+        an arbitrary origin, so "0" only *accidentally* means "long ago" — on a
+        freshly booted host it can read as "just now" and swallow the first poll.
+        """
+        if self._last_poll is None:
+            return True
+        return time.monotonic() - self._last_poll >= max(0.0, float(minutes) * 60.0)
 
     def _sleep_seconds(self, now: datetime) -> float:
         live = self.cfg.live
         cand: List[float] = []
         if live.intraday_poll_minutes and _market_open(live.market_timezone, now,
                                                         (live.session_open, live.session_close)):
-            cand.append(max(20.0, live.intraday_poll_minutes * 60 - (time.monotonic() - self._last_poll)))
+            if self._last_poll is None:
+                cand.append(0.0)
+            else:
+                cand.append(max(20.0, live.intraday_poll_minutes * 60
+                                - (time.monotonic() - self._last_poll)))
         for t in (live.scan_times or []):
-            hh, mm = _parse_hhmm(t)
+            parsed = _parse_hhmm(t)
+            if parsed is None:
+                continue
+            hh, mm = parsed
             due = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
             if due <= now:
                 due += timedelta(days=1)
@@ -123,6 +157,9 @@ class LiveLoop:
         log.info("live loop started · tz=%s · poll=%s min · scans=%s · universe=%s",
                  live.market_timezone, live.intraday_poll_minutes, live.scan_times,
                  len(self.scanner.universe()))
+        if not getattr(self.scanner.dispatcher, "deliverable", False):
+            log.warning("no working telegram transport — alerts will be logged, not sent "
+                        "(check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env)")
         if live.run_on_startup:
             self._scan("startup")
         while not self._stop:
@@ -142,9 +179,19 @@ class LiveLoop:
         return 0
 
     def _scan(self, tag: str) -> None:
+        """Run one cycle.
+
+        The mode follows the **market**, not the trigger: a scan scheduled for
+        11:30 or 13:30 lands squarely inside the session, and running it in
+        closed-bar mode would (a) skip the intraday rebuild of today's bar and
+        (b) read the previous session's close as if it were the live price —
+        so every mid-session tap would be missed, and a stale tap would be
+        re-reported. ``--once`` (the cron entry point) was hit hardest: its tag
+        is neither ``intraday`` nor ``startup``, so it could never go live.
+        """
         live = self.cfg.live
         open_now = _market_open(live.market_timezone, session=(live.session_open, live.session_close))
-        mode = "live" if (open_now and tag in ("intraday", "startup")) else "eod"
+        mode = "live" if open_now else "eod"
         self._last_poll = time.monotonic()
         self._cycles += 1
         log.info("scan cycle: %s (mode=%s, market %s)", tag, mode, "OPEN" if open_now else "CLOSED")
@@ -159,8 +206,7 @@ class LiveLoop:
                     pass
             return
         try:
-            if self.scanner.telegram is not None and getattr(self.scanner.cfg.telegram, "enabled", True):
-                self.scanner.dispatcher.retry_pending()
+            self.scanner.dispatcher.retry_pending()
         except Exception as exc:
             log.debug("retry pass failed: %s", exc)
         log.info("cycle %s → %s", tag, rep.summary_line)
@@ -189,5 +235,5 @@ class LiveLoop:
             log.debug("heartbeat failed: %s", exc)
 
 
-def _parse_hm(text: str) -> Tuple[int, int]:
+def _parse_hm(text: str) -> Optional[Tuple[int, int]]:
     return _parse_hhmm(text)

@@ -19,7 +19,12 @@ data:
   corporate_adjustments: true    # back-adjusted prices (splits/dividends), like TradingView
   cache_dir: data/cache
   cache_max_age_minutes: 5       # during the session: refetch after 5 min
-  eod_cache_max_age_minutes: 1440
+  # Closed-bar scans.  Keep this SHORTER than the gap between the last two
+  # post-close scan_times (15:35 -> 16:10), otherwise the "settled EOD bar"
+  # scan just re-reads the frame fetched before the closing print was final.
+  # Live and closed-bar frames are cached separately, so a mid-session scan can
+  # never be handed a stale frame either.
+  eod_cache_max_age_minutes: 30
   rate_limit_per_sec: 5          # be nice to Yahoo/NSE endpoints
   retry_max: 3
   tick_sizes:                  # syminfo.mintick per market (drives Ticks front-run + Distal+1 tick)
@@ -85,7 +90,7 @@ alerts:
                                # indicator printed can be missed by a delayed feed
   skip_stale_bars: true        # never alert when the last bar is not today's session
   once_per_symbol_per_day: true
-  min_liquidity_dollar_volume: 5000000000   # ~₹5000 crore / 20d median turnover
+  min_liquidity_dollar_volume: 5000000000   # ₹ on NSE/BSE: ~₹500 crore 20d median turnover
   min_price: 20
   max_price: 0
   max_age_bars: 0

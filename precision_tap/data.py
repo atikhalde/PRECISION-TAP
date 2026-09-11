@@ -26,7 +26,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date as date_cls, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -45,6 +45,47 @@ UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
 # ─────────────────────────────────────────────────────────────────────────────
 # Normalisation
 # ─────────────────────────────────────────────────────────────────────────────
+
+#: NSE/BSE only (enforced in :class:`~precision_tap.params.DataConfig`), so the
+#: exchange clock is always the Indian one.
+MARKET_TZ = {"NSE": "Asia/Kolkata", "BSE": "Asia/Kolkata"}
+DEFAULT_MARKET_TZ = "Asia/Kolkata"
+
+#: The EOD daily bar only settles a while after the 15:30 close — before this
+#: local time a closed-bar scan legitimately still shows the *previous* session.
+EOD_SETTLE_MIN = 16 * 60 + 10
+
+#: Providers that can return today's (possibly forming) bar.
+LIVE_PROVIDERS = {"yfinance", "yahoo", "yahoo_chart", "chart"}
+
+
+def _market_tz(name: str = "NSE") -> str:
+    return MARKET_TZ.get(str(name or "").upper(), DEFAULT_MARKET_TZ)
+
+
+def _now_tz(tzname: str) -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tzname))
+    except Exception:
+        return datetime.now().astimezone()
+
+
+def _expected_last_bar_date(tzname: str = DEFAULT_MARKET_TZ, *, live: bool = False) -> date_cls:
+    """Newest session date the feed should already be able to return.
+
+    ``live``      -> today's session (the forming bar a touch alert needs).
+    not ``live``  -> the last *completed* session; before the EOD bar settles
+                     (``EOD_SETTLE_MIN``) that is the previous weekday.
+    """
+    now = _now_tz(tzname)
+    d = now.date()
+    if not live and (now.hour * 60 + now.minute) < EOD_SETTLE_MIN:
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:                        # Sat/Sun roll back to Friday
+        d -= timedelta(days=1)
+    return d
+
 
 def _bar_is_today(ts, meta: dict | None = None) -> bool:
     """Is this bar stamped with today's session date? (exchange timezone aware)"""
@@ -324,11 +365,15 @@ class DataSource:
             end: Optional[str] = None, use_cache: bool = True) -> Bars:
         cfg = self.cfg
         days = int(lookback_days or cfg.lookback_days)
-        key = f"{symbol}_{cfg.interval}_{days}d_{end or 'live'}"
+        # live and closed-bar frames are cached under different keys: a live scan
+        # must never be handed a frame fetched for (and valid for) a closed-bar
+        # scan, and today's *forming* bar must never leak into the EOD cache.
+        key = f"{symbol}_{cfg.interval}_{days}d_{end or ('live' if self.live else 'eod')}"
         if use_cache:
             cached = self.cache.load(key)
-            if cached is not None and len(cached) >= cfg.min_bars:
-                return Bars(symbol=symbol, df=cached, source="cache", live=self.live)
+            if cached is not None and len(cached) >= cfg.min_bars and self._cache_usable(cached, end):
+                return Bars(symbol=symbol, df=cached, source="cache",
+                            live=bool(self.live and self._has_current_bar(cached)))
         try:
             symbol = self.fetch_symbol(symbol)
         except ValueError as exc:
@@ -347,11 +392,40 @@ class DataSource:
         except Exception as exc:
             log.debug("fetch failed for %s: %s", symbol, exc)
             return Bars(symbol=symbol, df=pd.DataFrame(columns=OHLCV), error=str(exc))
-        if bars.ok and use_cache and not self.live:
-            self.cache.store(key, bars.df)
-        if bars.ok and self.live and bars.source != "cache":
+        if bars.ok and use_cache and bars.source != "cache":
             self.cache.store(key, bars.df)
         return bars
+
+    # ── cache freshness ──────────────────────────────────────────────────
+    def _tracks_live_market(self, end: Optional[str]) -> bool:
+        """True when this request is for *current* data (no historical ``end``)."""
+        return end is None and self.cfg.provider in LIVE_PROVIDERS
+
+    def _has_current_bar(self, df: pd.DataFrame) -> bool:
+        """Does the newest row carry the session the feed should already have?"""
+        if df is None or df.empty:
+            return False
+        try:
+            return pd.Timestamp(df.index[-1]).date() >= self._expected_date()
+        except Exception:
+            return False
+
+    def _expected_date(self) -> date_cls:
+        return _expected_last_bar_date(_market_tz(self.cfg.market), live=bool(self.live))
+
+    def _cache_usable(self, df: pd.DataFrame, end: Optional[str]) -> bool:
+        """TTL is not enough: a cached frame can be a whole session behind.
+
+        The on-disk cache is keyed by live/EOD scope, but the TTL is measured in
+        minutes, and a session boundary is what actually makes a frame obsolete
+        (last night's EOD frame is useless for this morning's touch check, and a
+        frame fetched before the close is useless for the settled EOD scan).
+        Offline providers (csv/synthetic) are exempt — their data is frozen by
+        definition, so only the TTL applies.
+        """
+        if not self._tracks_live_market(end):
+            return True
+        return self._has_current_bar(df)
 
     def get_many(self, symbols: Sequence[str], *, lookback_days: Optional[int] = None,
                  end: Optional[str] = None, workers: int = 8,
@@ -504,7 +578,10 @@ class DataSource:
         if self.live and self.cfg.live_intraday_bar and not end and len(df):
             merged = self._yfinance_live_bar(tk, df)
             if merged is not None:
-                df, live, src = merged, True, "yfinance+intraday"
+                df, src = merged, "yfinance+intraday"
+                # only claim "live" when the rebuilt bar really is today's —
+                # a merge that lands on an older session must not be trusted
+                live = bool(not df.empty and _bar_is_today(df.index[-1], meta))
         return Bars(symbol=symbol, df=self._trim(df, days), meta=meta, live=live, source=src)
 
     def _yfinance_live_bar(self, tk, daily: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -530,8 +607,16 @@ class DataSource:
                 pass
         if intra.empty:
             return None
-        today = intra.index[-1].date()
-        todays = intra[[d == today for d in intra.index.date]]
+        # session date in *exchange* time, not the feed's stamp (a UTC-stamped
+        # feed otherwise rolls the early IST bars into the previous day)
+        tzname = _market_tz(self.cfg.market)
+        try:
+            local = intra.index.tz_convert(tzname) if getattr(intra.index, "tz", None) is not None \
+                else intra.index.tz_localize(tzname)
+        except Exception:
+            local = intra.index
+        today = local[-1].date()
+        todays = intra[[d == today for d in local.date]]
         if todays.empty:
             return None
         stamp = pd.Timestamp(datetime.combine(today, datetime.min.time()))

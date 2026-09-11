@@ -29,10 +29,10 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import numpy as np
 import pandas as pd
 
-from .alerts import (AlertDispatcher, build_buttons, dedupe_key, event_name, passes_filters,
-                     render_message)
+from .alerts import (AlertDispatcher, build_buttons, dedupe_key, event_name, event_rank,
+                     passes_filters, render_message)
 from .chart import render_chart
-from .data import Bars, DataSource, read_universe
+from .data import LIVE_PROVIDERS, Bars, DataSource, read_universe
 from .engine import EV_APPROACH, EV_CONFIRMED, EV_INVALID, EV_NEW, EV_TAP, EngineResult, Event, Zone, run_engine
 from .params import AlertConfig, DataConfig, Params, ScanConfig, TelegramConfig
 
@@ -143,11 +143,18 @@ class Scanner:
             from .telegram import TelegramClient
             self.telegram = TelegramClient(cfg.telegram)
             self._tg_own = True
-        if self.telegram is not None and not getattr(self.telegram, "configured", True) and not dry_run:
-            log.warning("telegram token/chat not configured — alerts will be logged + queued only")
+        # An unconfigured client is worse than no client: `dispatch` would hand it
+        # every alert, the send would raise, and the alert would land in the retry
+        # queue where it is retried (and dropped) forever — the scanner looks
+        # alive while nothing is ever delivered.  Refuse to build that path.
+        if self.telegram is not None and not getattr(self.telegram, "configured", True):
+            if not dry_run:
+                log.warning("telegram token/chat not configured — alerts will be logged only "
+                            "(set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env)")
+            self.telegram = None
         self.dispatcher = AlertDispatcher(cfg.alert, self.telegram, store, cfg.params,
                                          render_charts=(self._render_chart if cfg.alert.chart else None),
-                                         dry_run=dry_run)
+                                         dry_run=dry_run or self.telegram is None)
 
     def close(self) -> None:
         if self._tg_own and self.telegram is not None:
@@ -174,7 +181,8 @@ class Scanner:
         if not bars.ok:
             st = SymbolScan(symbol=symbol, error=bars.error or "no data")
             return st
-        return self._scan_frame(symbol, bars, live=bool(live and bars.live))
+        return self._scan_frame(symbol, bars, live=bool(live and bars.live),
+                                historical=bool(end))
 
     # ── full cycle ───────────────────────────────────────────────────────
     def scan(self, symbols: Optional[Sequence[str]] = None, *, live: Optional[bool] = None,
@@ -197,13 +205,14 @@ class Scanner:
         frames: Dict[str, Bars] = src.get_many(uni, workers=workers or cfg.live.max_workers,
                                               progress=progress)
         self._frames = {k: v.df for k, v in frames.items() if v.ok}
-        items: List[Tuple[Event, Dict[str, Any]]] = []
+        items: List[Tuple[SymbolScan, Event, Dict[str, Any]]] = []
         for sym in uni:
             b = frames.get(sym)
             if b is None or not b.ok:
                 rep.errors += 1
                 continue
-            st = self._scan_frame(sym, b, live=bool(live and not end) and bool(b.live))
+            st = self._scan_frame(sym, b, live=bool(live and not end) and bool(b.live),
+                                  historical=bool(end))
             rep.rows.append(st)
             if not st.ok:
                 rep.errors += 1
@@ -221,13 +230,14 @@ class Scanner:
                                          already_seen=(lambda e: self.store.seen(dedupe_key(e, cfg.alert)))
                                          if self.store else None)
                 if ok:
-                    items.append((ev, ctx))
+                    items.append((st, ev, ctx))
                 else:
                     log.debug("skip %s %s: %s", sym, event_name(ev), why)
-        rep.alerts = [(next((r for r in rep.rows if r.symbol == e.symbol), SymbolScan(e.symbol)), e)
-                      for e, _ in items]
+        # highest-value signal first, then alphabetical — the same order Telegram sees
+        items.sort(key=lambda ic: (event_rank(ic[1]), ic[1].symbol))
+        rep.alerts = [(st, ev) for st, ev, _ in items]
         if send and items:
-            rep.dispatch = self.dispatcher.dispatch(items)
+            rep.dispatch = self.dispatcher.dispatch([(ev, ctx) for _, ev, ctx in items])
         elif items:
             rep.dispatch = {"would_send": len(items)}
         rep.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -258,7 +268,16 @@ class Scanner:
         cache[symbol] = p
         return p
 
-    def _scan_frame(self, symbol: str, bars: Bars, *, live: bool) -> SymbolScan:
+    def _tracks_live_market(self) -> bool:
+        """Is this run reading a feed that follows the exchange clock?
+
+        Only then does "the newest bar is not a recent session" mean anything.
+        A csv/synthetic/backtest replay is frozen by definition.
+        """
+        return self.cfg.data.provider in LIVE_PROVIDERS
+
+    def _scan_frame(self, symbol: str, bars: Bars, *, live: bool,
+                    historical: bool = False) -> SymbolScan:
         p = self._params_for(symbol)
         st = SymbolScan(symbol=symbol)
         df = bars.df
@@ -268,8 +287,20 @@ class Scanner:
         st.ok = True
         st.bars = len(df)
         st.live = live
+        st.stale = (not historical and self._tracks_live_market()
+                    and _is_stale_bar(df.index[-1], self.cfg.live.market_timezone,
+                                      strict=bool(live)))
         res = run_engine(df, p, symbol=symbol, intrabar_last=live, zone_cap=10 ** 6)
         st.result, st.df, st.events = res, df, res.events
+        # Closed-bar parity pass.  On the forming bar the engine deliberately
+        # creates no zone and confirms no defence (that is what makes an intraday
+        # tap non-repainting), so `alerts.match_indicator_100` replays the same
+        # frame with the last bar *closed* and keeps the events the indicator
+        # would already have printed — including every `confirmed`, which can
+        # never come from the intrabar pass.
+        if live and self.cfg.alert.match_indicator_100:
+            closed = run_engine(df, p, symbol=symbol, intrabar_last=False, zone_cap=10 ** 6)
+            st.events_closed = [e for e in closed.events if not e.intrabar]
         A = res.arrays
         i = len(df) - 1
         st.price = float(A["close"][i])
@@ -424,6 +455,48 @@ def _market_open(tzname: str = "Asia/Kolkata", now: Optional[datetime] = None,
         return 1 <= now.hour <= 23
     mins = now.hour * 60 + now.minute
     return (rng[0][0] * 60 + rng[0][1]) <= mins < (rng[1][0] * 60 + rng[1][1])
+
+
+def _session_now(tzname: str):
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(tzname))
+    except Exception:
+        return datetime.now().astimezone()
+
+
+def _is_stale_bar(bar_ts, tzname: str, *, strict: bool = False) -> bool:
+    """True when the newest bar is too old to alert on.
+
+    ``strict`` (intraday) — the bar must be *today's* session. A delayed feed that
+    still shows yesterday's close must not fire a "price is tapping the OB right
+    now" alert; the ``skip_stale_bars`` guard exists exactly for that.
+
+    Not strict (closed-bar scan) — the most recent *completed* session is enough,
+    so a Monday-morning scan still alerts on Friday's close, and a Saturday run
+    still reports Friday. Only a feed that has fallen several sessions behind is
+    treated as stale (holidays are absorbed by the slack).
+    """
+    try:
+        bar = pd.Timestamp(bar_ts)
+        if bar.tzinfo is not None:
+            try:
+                bar = bar.tz_convert(tzname)
+            except Exception:
+                pass
+            bar = bar.tz_localize(None)
+        bday = bar.date()
+    except Exception:
+        return False
+    now = _session_now(tzname).date()
+    if bday >= now:                                  # today (or a tz-shifted stamp)
+        return False
+    if strict:
+        return not _same_session(bar_ts, tzname)
+    try:
+        return int(np.busday_count(bday, now)) > 3   # ≥4 sessions behind == broken feed
+    except Exception:
+        return (now - bday).days > 6
 
 
 def _same_session(bar_ts, tzname: str) -> bool:
