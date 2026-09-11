@@ -10,6 +10,10 @@
 #   vars.SCAN_SYMBOLS    (opt)   ad-hoc universe, e.g. "RELIANCE,TCS,INFY"
 #   vars.SCAN_EVENTS     (opt)   e.g. "tap1" or "tap1,approach,confirmed"
 #   vars.SCAN_MIN_DV     (opt)   20d median turnover floor, ₹ crore
+#   vars.SCAN_UNIVERSE   (opt)   nifty50|nifty100|nifty200|nifty500|allnse|file
+#                                (nseindia archives reject datacenter IPs — the
+#                                preset falls back to Wikipedia tables; a repo
+#                                file like universe/nse.txt always works)
 #
 # Schedules are UTC (GitHub cron is always UTC).  NSE 09:15–15:30 IST is
 # 03:45–10:00 UTC.  The scanner picks intraday-vs-closed-bar mode from the
@@ -61,7 +65,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   TZ: Asia/Kolkata          # readable log stamps; the scanner is tz-aware regardless
@@ -73,7 +77,10 @@ jobs:
   live-scan:
     name: Live market scan → Telegram
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A full-market universe (nifty500 ≈ 500 fetches, nse_all ≈ 2 000+) at the
+    # configured rate limit needs far more than a quick job — 20 min cut live
+    # cycles off mid-universe.
+    timeout-minutes: 45
 
     steps:
       - name: Check out repository
@@ -108,14 +115,14 @@ jobs:
         run: |
           # NOTE: `cache-hit` is only true on an *exact* key match, which this
           # workflow never produces (each run saves under its own run id) — the
-          # restore always arrives via `restore-keys`.  Checking `cache-hit`
-          # here warned on every single run even when the ledger was restored.
-          # `cache-matched-key` is the honest signal, plus the file itself.
-          if [ -z "${{ steps.state.outputs.cache-matched-key }}" ] || [ ! -f data/state.sqlite3 ]; then
+          # restore always arrives via `restore-keys`.  `cache-matched-key` is
+          # empty on restore-key matches in actions/cache@v4, so the only honest
+          # signal is the ledger file itself: warn when it was NOT restored.
+          if [ ! -f data/state.sqlite3 ]; then
             echo "::warning::No prior ledger restored — empty dedupe set, so alerts already sent today may be re-delivered once."
             exit 0
           fi
-          echo "ledger restored via ${{ steps.state.outputs.cache-matched-key }}"
+          echo "ledger restored (${{ steps.state.outputs.cache-matched-key }})"
           python - <<'PY'
           import sqlite3
           try:
@@ -189,6 +196,11 @@ jobs:
 
           if [ -n "${{ vars.SCAN_EVENTS }}" ]; then
             ARGS+=(--events "${{ vars.SCAN_EVENTS }}")
+          fi
+          # universe override: nifty50 | nifty100 | nifty200 | nifty500 |
+          # allnse (whole exchange) | a repo file path, e.g. universe/nse.txt
+          if [ -n "${{ vars.SCAN_UNIVERSE }}" ]; then
+            ARGS+=(--set "data.universe_file=${{ vars.SCAN_UNIVERSE }}")
           fi
           if [ -n "${{ vars.SCAN_MIN_DV }}" ]; then
             ARGS+=(--min-dollar-volume "${{ vars.SCAN_MIN_DV }}")
@@ -331,20 +343,3 @@ jobs:
           run <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">#${{ github.run_number }}</a> · ${{ github.event_name }}
           check the workflow log for the traceback."
 
-      # ── ⚠ TEMPORARY session-branch diagnostics ──────────────────────────────
-      # Pushes the raw scan report + logs back to this branch so the sandboxed
-      # agent can read them (runner log/artifact download is unreachable there).
-      # Remove this step before merging.
-      - name: Push diagnostics to branch (temporary)
-        if: always()
-        run: |
-          git config user.name "diag-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          mkdir -p diag
-          cp scan-output.txt diag/ 2>/dev/null || true
-          cp results/scan_*.json diag/ 2>/dev/null || true
-          cp results/scan_*.md diag/ 2>/dev/null || true
-          git add diag
-          git commit -m "diag: scan report (auto) [skip ci]" || echo "nothing to commit"
-          git pull --rebase origin ${{ github.ref_name }} || true
-          git push origin HEAD:${{ github.ref_name }} || echo "push failed"
