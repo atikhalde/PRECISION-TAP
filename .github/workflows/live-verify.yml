@@ -80,34 +80,28 @@ jobs:
         run: |
           python -m precision_tap scan --no-send --no-charts 2>&1 | tee probe.txt
 
-      - name: 2 · live cycle with the FIXED code (delivers to Telegram)
+      - name: 2 · live cycle, fixed code — real delivery (tap events too, capped)
         continue-on-error: true
         run: |
-          python -m precision_tap scan --no-charts 2>&1 | tee live.txt
+          python -m precision_tap scan --no-charts --messages --recent-bars 3 \
+            --events tap1,approach,confirmed,tap \
+            --set alerts.daily_limit=3 2>&1 | tee live.txt
 
-      - name: 3 · transport check (bot token -> chat)
+      - name: 3 · feed probe (is today's bar really the forming bar?)
         continue-on-error: true
         run: |
-          python -m precision_tap telegram-test 2>&1 | tee telegram.txt
+          python -m precision_tap doctor --net 2>&1 | tail -12 | tee doctor.txt
 
-      - name: 4 · wider alert window, delivered only if something real fired
-        continue-on-error: true
-        run: |
-          python -m precision_tap scan --no-send --no-charts --recent-bars 3 \
-            -v 2>&1 | tail -40 | tee wide.txt
-          if grep -qE "alerts matched: [1-9]" wide.txt; then
-            echo "--- sending the same cycle for real ---"
-            python -m precision_tap scan --no-charts --recent-bars 3 2>&1 | tail -25 | tee wide_send.txt
-          else
-            echo "nothing to deliver in the wider window" | tee wide_send.txt
-          fi
-
-      - name: 5 · the same probe against the PRE-FIX data.py
+      - name: 4 · the same cycle against the PRE-FIX data.py (cold cache)
         continue-on-error: true
         run: |
           git fetch --depth 1 origin "$BASE_SHA" || true
           git show "$BASE_SHA:precision_tap/data.py" > precision_tap/data.py
-          python -m precision_tap scan --no-send --no-charts 2>&1 | tee before.txt
+          rm -rf data/cache
+          python -m precision_tap scan --no-send --no-charts \
+            --set data.cache_dir=/tmp/cache_before \
+            --set data.cache_max_age_minutes=0 \
+            --set data.eod_cache_max_age_minutes=0 2>&1 | tail -20 | tee before.txt
           git checkout -- precision_tap/data.py
 
       - name: Report back to the PR
@@ -120,15 +114,13 @@ jobs:
             echo ""
             echo "runner \`ubuntu-latest\` · ref \`${{ github.ref_name }}\` · commit \`${GITHUB_SHA::7}\`"
             echo ""
-            for part in env probe live telegram wide wide_send before; do
+            for part in env probe live doctor before; do
               case "$part" in
                 env)       title="0 · environment (versions on the runner)";;
                 probe)     title="1 · probe, fixed code (<code>scan --no-send</code>)";;
-                live)      title="2 · live cycle, fixed code (delivered to Telegram)";;
-                telegram)  title="3 · transport check (<code>telegram-test</code>)";;
-                wide)      title="4 · wider window, <code>--recent-bars 3</code> (not sent)";;
-                wide_send) title="4b · wider window, delivered";;
-                before)    title="5 · the same probe with the pre-fix <code>data.py</code>";;
+                live)      title="2 · live cycle, fixed code — DELIVERED to Telegram";;
+                doctor)    title="3 · feed probe (<code>doctor --net</code>)";;
+                before)    title="4 · the same cycle with the pre-fix <code>data.py</code>, cold cache";;
               esac
               echo "<details><summary>$title</summary>"
               echo ""
@@ -149,8 +141,6 @@ jobs:
             env.txt
             probe.txt
             live.txt
-            telegram.txt
-            wide.txt
-            wide_send.txt
+            doctor.txt
             before.txt
           if-no-files-found: ignore
