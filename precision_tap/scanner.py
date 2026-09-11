@@ -39,6 +39,40 @@ from .params import AlertConfig, DataConfig, Params, ScanConfig, TelegramConfig
 log = logging.getLogger("precision_tap.scanner")
 
 
+def _skip_bucket(why: str) -> str:
+    """Collapse a ``passes_filters`` rejection into a short bucket name.
+
+    Messages like ``illiquid ($1161.7M/day < $5000M)`` are per-symbol; the
+    cycle summary only needs the reason, so the numbers are stripped.
+    """
+    w = (why or "").strip().lower()
+    for key, label in (("illiquid", "illiquid"),
+                       ("min_price", "below min_price"),
+                       ("max_price", "above max_price"),
+                       ("zone age", "zone too old"),
+                       ("already alerted", "already alerted"),
+                       ("repeat tap", "repeat tap"),
+                       ("not enabled", "event type disabled")):
+        if key in w:
+            return label
+    return w or "filtered"
+
+
+_EXCHANGE_LABELS = {
+    "NSI": "NSE", "NSE": "NSE", "NSI.": "NSE", "BSE": "BSE", "BOM": "BSE",
+}
+
+
+def exchange_label(raw: Any) -> str:
+    """Map a provider exchange code onto the label we print in alerts.
+
+    Yahoo reports the NSE as ``NSI``; on the alert we want plain ``NSE``.
+    Anything unknown is passed through unchanged.
+    """
+    key = str(raw or "").strip().upper()
+    return _EXCHANGE_LABELS.get(key, str(raw or ""))
+
+
 @dataclass
 class SymbolScan:
     symbol: str
@@ -206,6 +240,7 @@ class Scanner:
                                               progress=progress)
         self._frames = {k: v.df for k, v in frames.items() if v.ok}
         items: List[Tuple[SymbolScan, Event, Dict[str, Any]]] = []
+        dropped: Dict[str, int] = {}
         for sym in uni:
             b = frames.get(sym)
             if b is None or not b.ok:
@@ -232,10 +267,16 @@ class Scanner:
                 if ok:
                     items.append((st, ev, ctx))
                 else:
+                    dropped[_skip_bucket(why)] = dropped.get(_skip_bucket(why), 0) + 1
                     log.debug("skip %s %s: %s", sym, event_name(ev), why)
         # highest-value signal first, then alphabetical — the same order Telegram sees
         items.sort(key=lambda ic: (event_rank(ic[1]), ic[1].symbol))
         rep.alerts = [(st, ev) for st, ev, _ in items]
+        if dropped:
+            # "why did nothing fire?" is the first question after every quiet cycle
+            tally = " · ".join(f"{why} {n}" for why, n in
+                               sorted(dropped.items(), key=lambda kv: (-kv[1], kv[0])))
+            rep.notes.append("nothing to send — " + tally if not items else "also filtered — " + tally)
         if send and items:
             rep.dispatch = self.dispatcher.dispatch([(ev, ctx) for _, ev, ctx in items])
         elif items:
@@ -353,8 +394,8 @@ class Scanner:
         ctx: Dict[str, Any] = {
             "price": st.price, "change_pct": st.change_pct, "atr": st.atr, "rvol": st.rvol,
             "timeframe": self.cfg.data.interval, "last_bar": st.last_date,
-            "exchange": (meta.get("fullExchangeName") or meta.get("exchangeName")
-                         or self.cfg.alert.default_exchange),
+            "exchange": exchange_label(meta.get("fullExchangeName") or meta.get("exchangeName")
+                                       or self.cfg.alert.default_exchange),
             "currency": meta.get("currency", "USD"), "zone_method": self.cfg.params.zone_method,
             "live": st.live, "bars": st.bars,
         }

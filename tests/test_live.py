@@ -546,3 +546,69 @@ def test_loop_recovers_from_a_failing_cycle(loop_clock):
     except KeyboardInterrupt:
         pass
     assert Boom.n >= 3, "the loop died on the first failure"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# alert content
+# ─────────────────────────────────────────────────────────────────────────────
+def test_tap_alert_prints_the_level_that_was_touched():
+    """``raise_after_first_tap`` lifts ``zone.entry`` *on the tap bar*.
+
+    By the time the alert is rendered the zone's live pre-order is already the
+    raised level, so printing ``zone.entry`` as "Buy limit ← Tap 1 trigger"
+    quotes a price the tap never touched.  The Pine label makes the same
+    distinction: "TAP n" at the touched price, then "Next <raised>".
+    """
+    from precision_tap.alerts import render_message
+    from precision_tap.engine import EV_TAP, Event, Zone
+    from precision_tap.params import AlertConfig, Params
+
+    z = Zone(zid=0, born=10, origin=9, top=100.0, bot=98.0, entry=100.60, entry0=100.05,
+             stop=97.0, atr0=1.0, taps=1, state=1, departed=True, adaptive=True)
+    ev = Event(kind=EV_TAP, bar=20, symbol="TCS.NS", zid=0, tap_no=1, level=100.05,
+               price=100.00, zone=z)
+    ctx = {"price": 100.20, "change_pct": -0.14, "atr": 1.0, "rvol": 1.4,
+           "exchange": "NSE", "timeframe": "1d", "entry": z.entry, "origin_date": "2026-09-01"}
+    text = render_message(ev, ctx, AlertConfig(), Params.default(), parse_mode="plain")
+    assert "100.05" in text, text          # the level that was actually tapped
+    assert "100.60" in text, text          # the next (raised) pre-order
+    assert "next pre-order" in text, text
+
+
+def test_non_tap_alerts_quote_the_live_pre_order():
+    """Approach / confirmed are about the level that is live *now*."""
+    from precision_tap.alerts import render_message
+    from precision_tap.engine import EV_APPROACH, Event, Zone
+    from precision_tap.params import AlertConfig, Params
+
+    z = Zone(zid=1, born=10, origin=9, top=100.0, bot=98.0, entry=100.60, entry0=100.05,
+             stop=97.0, atr0=1.0, taps=1, state=1, departed=True, adaptive=True)
+    ev = Event(kind=EV_APPROACH, bar=21, symbol="TCS.NS", zid=1, level=100.60,
+               price=100.90, zone=z)
+    ctx = {"price": 100.90, "change_pct": 0.2, "atr": 1.0, "rvol": 1.1,
+           "exchange": "NSE", "timeframe": "1d", "entry": z.entry}
+    text = render_message(ev, ctx, AlertConfig(), Params.default(), parse_mode="plain")
+    assert "100.60" in text, text
+
+
+def test_a_quiet_cycle_says_why_nothing_was_sent(monkeypatch):
+    """"Why did nothing fire?" is the first question after an empty cycle, so
+    the report must carry the filter tally instead of a bare `alerts matched: 0`."""
+    patch_source(monkeypatch)
+    cfg = scan_cfg(alert={"recent_bars": 3})
+    cfg.alert.min_liquidity_dollar_volume = 9e18        # nothing can pass
+    sc = Scanner(cfg, store=None, dry_run=True)
+    rep = sc.scan(live=True, progress=False)
+    sc.close()
+    assert rep.alerts == []
+    assert any(n.startswith("nothing to send") and "illiquid" in n for n in rep.notes), rep.notes
+
+
+def test_exchange_label_maps_provider_codes():
+    from precision_tap.scanner import exchange_label
+    # Yahoo reports the NSE as "NSI"; the alert should read NSE
+    assert exchange_label("NSI") == "NSE"
+    assert exchange_label("nse") == "NSE"
+    assert exchange_label("BOM") == "BSE"
+    assert exchange_label("NASDAQ") == "NASDAQ"      # unknown codes pass through
+    assert exchange_label(None) == ""

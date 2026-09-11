@@ -46,6 +46,15 @@ jobs:
       - name: Exercise the complete offline workflow
         run: python -m precision_tap demo --no-charts
 
+      # The live path (provider → intraday rebuild → scanner → Telegram) with a
+      # fake chart API and a mock Bot API.  Exits non-zero unless every alert
+      # the cycle found was actually delivered.
+      - name: Live pipeline drill (offline, both providers)
+        run: |
+          python tools/live_drill.py --provider yahoo --cycles 2
+          python tools/live_drill.py --provider yfinance --cycles 2
+          python tools/live_drill.py --mode eod --quiet
+
       - name: Upload scanner/backtest reports
         if: always() && matrix.python-version == '3.11'
         uses: actions/upload-artifact@v4
