@@ -293,13 +293,20 @@ def cmd_scan(args) -> int:
         for note in rep.notes:
             print("  note:", note)
         sc.close()
-        # A green exit must mean "the scan genuinely worked".  Two states are
+        # A green exit must mean "the scan genuinely worked".  Three states are
         # broken-pipeline states, not quiet markets, and must fail loudly so a
         # scheduler (cron / GitHub Actions) shows red instead of silent green:
-        # the feed failing outright, or signals that never reached Telegram
-        # (bad chat id, blocked bot).  A cycle skipped for lack of a fresh bar
-        # (NSE holiday, lagging vendor) stays green — failing it would spam a
-        # red X + a failure ping on every 15-min slot of every holiday.
+        # an empty universe, the feed failing outright, or signals that never
+        # reached Telegram (bad chat id, blocked bot).  A cycle skipped for lack
+        # of a fresh bar (NSE holiday, lagging vendor) stays green — failing it
+        # would spam a red X + a failure ping on every 15-min slot of every
+        # holiday.
+        if rep.universe == 0:
+            print("\nSCAN FAILED: the universe resolved to 0 symbols — "
+                  "fix data.universe_file / PRECISION_TAP_UNIVERSE "
+                  "(preset downloads are geo-fenced; try universe/nse.txt)",
+                  file=sys.stderr)
+            return 2
         if rep.universe > 0 and rep.usable == 0 and rep.errors > rep.skipped_symbols:
             print(f"\nSCAN FAILED: 0/{rep.universe} symbols usable — "
                   f"errors={rep.errors} skipped={rep.skipped_symbols} "
@@ -336,6 +343,9 @@ def cmd_run(args) -> int:
                 if rep is None:
                     print("RUN FAILED: the cycle crashed — see the log", file=sys.stderr)
                     return 1
+                if rep.universe == 0:
+                    print("RUN FAILED: universe resolved to 0 symbols", file=sys.stderr)
+                    return 2
                 if rep.universe > 0 and rep.usable == 0 and rep.errors > rep.skipped_symbols:
                     print(f"RUN FAILED: 0/{rep.universe} symbols usable "
                           f"(errors={rep.errors} skipped={rep.skipped_symbols})", file=sys.stderr)

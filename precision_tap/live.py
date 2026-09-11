@@ -166,9 +166,15 @@ class LiveLoop:
     def run(self) -> int:
         live = self.cfg.live
         self.install_signal_handlers()
+        # A transient universe-download failure (preset presets resolve over
+        # HTTP) must not kill the daemon at startup — the cycles below retry.
+        try:
+            n_uni = len(self.scanner.universe())
+        except Exception as exc:
+            log.warning("universe resolution failed at startup (%s) — cycles will retry", exc)
+            n_uni = -1
         log.info("live loop started · tz=%s · poll=%s min · scans=%s · universe=%s",
-                 live.market_timezone, live.intraday_poll_minutes, live.scan_times,
-                 len(self.scanner.universe()))
+                 live.market_timezone, live.intraday_poll_minutes, live.scan_times, n_uni)
         if not getattr(self.scanner.dispatcher, "deliverable", False):
             log.warning("no working telegram transport — alerts will be logged, not sent "
                         "(check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env)")

@@ -966,15 +966,89 @@ def synthetic_frame(n: int = 600, seed: int = 7, start: str = "2022-01-03",
 # Universe
 # ─────────────────────────────────────────────────────────────────────────────
 
-NSE_INDICES = {
-    "nifty50":     "https://en.wikipedia.org/wiki/Nifty_50",
-    "nifty100":    "https://en.wikipedia.org/wiki/Nifty_100",
-    "nifty200":    "https://en.wikipedia.org/wiki/Nifty_200",
-    "nifty500":    "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
-    "niftynext50": "https://en.wikipedia.org/wiki/Nifty_Next_50",
-    "sensex30":    "https://en.wikipedia.org/wiki/BSE_SENSEX",
-    "banknifty":   "https://en.wikipedia.org/wiki/Nifty_Bank",
+def _wiki(title: str) -> str:
+    return f"https://en.wikipedia.org/wiki/{title}"
+
+
+def _nse_csv(name: str) -> str:
+    return f"https://nsearchives.nseindia.com/content/indices/ind_{name}.csv"
+
+
+def _nse_csv_alt(name: str) -> str:
+    return f"https://archives.nseindia.com/content/indices/ind_{name}.csv"
+
+
+#: Full exchange list (all listed equities).  Filtered to the EQ/BE/BZ series
+#: so bonds/ETFs/units in the file are dropped.
+NSE_ALL_EQUITIES_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+NSE_ALL_EQUITIES_URL_ALT = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+_EQUITY_SERIES = {"EQ", "BE", "BZ"}
+
+#: Every index preset resolves through an ordered *chain* of sources: the first
+#: one that returns symbols wins.  nseindia.com rejects datacenter IPs (GitHub
+#: runners included) with 4xx/5xx, so every chain carries a Wikipedia-table
+#: fallback that works from anywhere — without this, a preset silently scans an
+#: empty universe and the run stays green with zero alerts.
+PRESET_SOURCES: Dict[str, List[Tuple[str, str]]] = {
+    # (url, mode) — mode is passed to _http_symbols: "csv" or "table"
+    "nifty50":     [(_nse_csv("nifty50list"), "csv"), (_nse_csv_alt("nifty50list"), "csv"),
+                    (_wiki("Nifty_50"), "table")],
+    "nifty100":    [(_nse_csv("nifty100list"), "csv"), (_nse_csv_alt("nifty100list"), "csv"),
+                    (_wiki("Nifty_100"), "table")],
+    "nifty200":    [(_nse_csv("nifty200list"), "csv"), (_nse_csv_alt("nifty200list"), "csv"),
+                    (_wiki("NIFTY_200"), "table")],
+    "nifty500":    [(_nse_csv("nifty500list"), "csv"), (_nse_csv_alt("nifty500list"), "csv"),
+                    (_wiki("NIFTY_500"), "table")],
+    "niftynext50": [(_nse_csv("niftynext50list"), "csv"), (_nse_csv_alt("niftynext50list"), "csv"),
+                    (_wiki("Nifty_Next_50"), "table")],
+    "sensex30":    [(_wiki("BSE_SENSEX"), "table")],
+    "banknifty":   [(_nse_csv("niftybanklist"), "csv"), (_nse_csv_alt("niftybanklist"), "csv"),
+                    (_wiki("Nifty_Bank"), "table")],
+    "allnse":      [(NSE_ALL_EQUITIES_URL, "csv-equities"), (NSE_ALL_EQUITIES_URL_ALT, "csv-equities")],
 }
+
+#: Back-compat mapping (first source of each chain) for anything still reading it.
+NSE_INDICES = {name: chain[0][0] for name, chain in PRESET_SOURCES.items()}
+
+#: other names the presets answer to
+PRESET_ALIASES = {
+    "nse_all": "allnse", "all_nse": "allnse", "all-nse": "allnse", "allequities": "allnse",
+    "nifty500": "nifty500", "nifty_500": "nifty500", "nifty 500": "nifty500",
+}
+
+
+def resolve_preset(name: str) -> List[str]:
+    """Symbols for an index preset, walking the source chain until one answers.
+
+    Raises ``RuntimeError`` when *no* source works — an empty list here would
+    otherwise reach the scanner, which would then "successfully" scan zero
+    symbols and exit green having sent nothing.
+    """
+    key = PRESET_ALIASES.get(str(name).strip().lower(), str(name).strip().lower())
+    if key == "allnse":
+        chains = PRESET_SOURCES["allnse"]
+        for url, mode in chains:
+            syms = _http_symbols(url, csv=True, equities_only=(mode == "csv-equities"))
+            if syms:
+                return syms
+        # the exchange file is geo-fenced; the broad index chain usually answers
+        log.warning("EQUITY_L.csv unreachable — falling back to the nifty500 chain")
+        return resolve_preset("nifty500")
+    chain = PRESET_SOURCES.get(key)
+    if not chain:
+        raise ValueError(f"unknown universe preset {name!r} — valid: "
+                         f"{sorted(set(PRESET_SOURCES))} | url:https://… | a file path")
+    errors: List[str] = []
+    for url, mode in chain:
+        syms = _http_symbols(url, table=(mode == "table"), csv=(mode.startswith("csv")))
+        if syms:
+            return syms
+        errors.append(url)
+    raise RuntimeError(
+        f"universe preset {key!r} resolved to 0 symbols — every source failed "
+        f"({'; '.join(errors)}). The nseindia archives reject datacenter IPs; "
+        "set data.universe_file to a local file (universe/nse.txt) or check network egress."
+    )
 
 
 def read_universe(source: Optional[str] = None, *, text: str = "",
@@ -991,9 +1065,8 @@ def read_universe(source: Optional[str] = None, *, text: str = "",
         low = s.lower()
         if low in {"sp500", "s&p500"}:
             out += _scrape_sp500()
-        elif low in NSE_INDICES:
-            out += _http_symbols(NSE_INDICES[low], table=not NSE_INDICES[low].endswith(".csv"),
-                                 csv=NSE_INDICES[low].endswith(".csv"))
+        elif low in PRESET_SOURCES or low in PRESET_ALIASES:
+            out += resolve_preset(low)
         elif low.startswith("http"):
             out += _http_symbols(s)
         elif Path(s).exists():
@@ -1025,21 +1098,30 @@ def _scrape_sp500() -> List[str]:
     return _http_symbols(_SP500_URL, table=True)
 
 
-def _http_symbols(url: str, *, table: bool = False, csv: bool = False) -> List[str]:
+def _http_symbols(url: str, *, table: bool = False, csv: bool = False,
+                  equities_only: bool = False) -> List[str]:
     try:
         import requests
         r = requests.get(url, headers={"User-Agent": UA, "Accept": "*/*"}, timeout=25)
         r.raise_for_status()
         html = r.text
     except Exception as exc:
-        log.error("universe download failed (%s) — using empty list", exc)
+        log.error("universe download failed (%s) — trying the next source", exc)
         return []
     if csv:
         try:
             df = pd.read_csv(io.StringIO(html))
-            col = next((c for c in df.columns
-                        if str(c).strip().lower() in ("symbol", "series", "security identifier")),
-                       df.columns[0])
+            cols = {str(c).strip().lower(): c for c in df.columns}
+            if equities_only:
+                # EQUITY_L.csv lists every listed instrument; keep tradable equity
+                # series only (EQ/BE/BZ) so bonds/ETFs/units never enter the universe
+                scol = cols.get("series")
+                if scol is not None:
+                    keep = df[scol].astype(str).str.strip().str.upper().isin(_EQUITY_SERIES)
+                    df = df[keep]
+            col = next((cols[c] for c in ("symbol", "security identifier") if c in cols), None)
+            if col is None:
+                col = df.columns[0]
             return [str(x).strip().upper() for x in df[col].tolist() if str(x).strip()]
         except Exception as exc:
             log.warning("universe csv parse failed: %s", exc)

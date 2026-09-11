@@ -216,7 +216,7 @@ class Scanner:
         d = self.cfg.data
         if d.universe:
             return [s.upper() for s in d.universe]
-        return read_universe(d.universe_file or None)
+        return read_universe(d.universe_file or None, suffix=d.symbol_suffix)
 
     # ── one symbol ───────────────────────────────────────────────────────
     def scan_symbol(self, symbol: str, *, live: bool, end: Optional[str] = None) -> SymbolScan:
@@ -341,6 +341,13 @@ class Scanner:
                 rep.notes.append(f"no usable symbols — {tally or 'every symbol was skipped'}; "
                                  f"the feed has no fresh bar "
                                  f"(NSE holiday, or the provider is lagging/down)")
+        if rep.universe == 0:
+            # A zero-symbol cycle is a configuration failure, not a quiet market:
+            # left unmarked it looks like a healthy green run that simply never
+            # sends anything (the classic "scanner works, Telegram is silent").
+            rep.notes.append("UNIVERSE EMPTY — data.universe_file resolved to 0 symbols "
+                             "(preset download failed, or the file is empty/commented out); "
+                             "nothing was scanned")
         if not items:
             # "why did nothing fire?" is the first question after every quiet
             # cycle, and silence is indistinguishable from a broken pipeline

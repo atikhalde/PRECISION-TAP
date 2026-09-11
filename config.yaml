@@ -12,7 +12,10 @@ data:
   interval: 1d                  # daily TF only — the indicator is designed for it
   market: NSE                   # NSE | BSE (label shown in alerts)
   symbol_suffix: ".NS"          # RELIANCE -> RELIANCE.NS ; use ".BO" for BSE
-  universe_file: universe/nse.txt   # or: nifty50 | nifty100 | nifty200 | nifty500 | sensex30
+  universe_file: nifty500          # full broad market: Nifty 500 (falls back to
+                                   # Wikipedia tables when nseindia blocks the host).
+                                   # allnse = every listed equity (~2000, slow);
+                                   # universe/nse.txt = 127-name starter watchlist
   lookback_days: 900            # history per symbol (>= 200 recommended for ATR/volume context)
   min_bars: 150                 # symbols with less history are skipped
   live_intraday_bar: true       # rebuild today's forming bar from 5m ticks (needed for touch alerts)
@@ -84,14 +87,18 @@ telegram:
   # proxy: http://127.0.0.1:7890
 
 alerts:
-  events: [tap1, approach, confirmed]   # new_ob | approach | tap1 | tap | confirmed | invalidated
+  events: [new_ob, tap1, approach, confirmed]  # new_ob proves liveness (a fresh OB
+                                               # forms most days on a 500-name universe);
+                                               # trim to [tap1, confirmed] for signal-only
   include_invalidations: false
   recent_bars: 1               # only events on the newest bar (1 == "this bar just tapped")
   match_indicator_100: true    # live mode also replays the last CLOSED bar, so nothing the
                                # indicator printed can be missed by a delayed feed
   skip_stale_bars: true        # never alert when the last bar is not today's session
   once_per_symbol_per_day: true
-  min_liquidity_dollar_volume: 5000000000   # ₹ on NSE/BSE: ~₹500 crore 20d median turnover
+  # ₹25 crore 20d-median turnover floor.  The old ₹500cr floor silently muted the
+  # whole mid/small-cap market — on a 500-name universe that filtered ~80% of names.
+  min_liquidity_dollar_volume: 250000000
   min_price: 20
   max_price: 0
   max_age_bars: 0
