@@ -1,0 +1,44 @@
+name: diag (temporary)
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "symbols for stage 3"
+        required: false
+        default: "0"
+permissions:
+  contents: write
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONUNBUFFERED: "1"
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: |
+          python -m pip install -q --upgrade pip
+          python -m pip install -q -r requirements.txt
+      - name: run diagnostics
+        continue-on-error: true
+        run: |
+          python -m precision_tap doctor --net | tee diag-doctor.txt || true
+          python tools/diag_scan.py | tee diag-scan.txt || true
+      - name: publish report to branch
+        if: always()
+        run: |
+          git config user.name "diag-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p diag
+          cp diag-doctor.txt diag/ 2>/dev/null || true
+          cp diag-scan.txt diag/ 2>/dev/null || true
+          cp diag-report.md diag/ 2>/dev/null || true
+          git add -f diag
+          git commit -m "diag: real-feed scan report (auto) [skip ci]" || echo "nothing to commit"
+          git pull --rebase origin "${{ github.ref_name }}" || true
+          git push origin HEAD:"${{ github.ref_name }}" || echo "push failed"
