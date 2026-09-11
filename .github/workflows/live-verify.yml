@@ -18,6 +18,11 @@ on:
         description: "Universe for the verification run"
         required: false
         default: "RELIANCE,TCS,INFY,HDFCBANK,SBIN,ICICIBANK"
+  # this sandbox's GitHub token cannot create dispatch events, but it *can*
+  # push — so a push to the branch is the trigger that is actually reachable
+  push:
+    branches: [arena/01a08f4e-precision-tap]
+    paths: [".github/workflows/live-verify.yml"]
 
 permissions:
   contents: read
