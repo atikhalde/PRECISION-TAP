@@ -65,6 +65,17 @@ class TelegramError(RuntimeError):
     pass
 
 
+class TelegramPermanentError(TelegramError):
+    """A rejection that retrying cannot fix (401 bad token, 400 chat not found,
+    403 bot blocked / not an admin).
+
+    These are the errors that make a scanner look healthy while nothing is ever
+    delivered, so they are surfaced instead of being parked in the retry queue.
+    """
+
+    status_code = 0
+
+
 @dataclass
 class SendResult:
     ok: bool
@@ -73,6 +84,7 @@ class SendResult:
     error: str = ""
     chunks: int = 1
     method: str = "sendMessage"
+    permanent: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -120,6 +132,8 @@ class TelegramClient:
                 log.warning("telegram 429: backing off %.1fs", wait)
                 time.sleep(wait)
                 last = rl
+            except TelegramPermanentError:
+                raise                               # a 401/400/403 never heals by waiting
             except Exception as exc:                # network hiccup / 5xx
                 last = exc
                 if attempt >= self.cfg.max_retries:
@@ -139,7 +153,12 @@ class TelegramClient:
             err.retry_after = float(ra)
             raise err
         if resp_status >= 400 or not data.get("ok", False):
-            raise TelegramError(f"{method} failed (HTTP {resp_status}): {data.get('description', body[:200])}")
+            msg = f"{method} failed (HTTP {resp_status}): {data.get('description', body[:200])}"
+            if 400 <= resp_status < 500 and resp_status != 429:
+                err = TelegramPermanentError(msg)
+                err.status_code = resp_status
+                raise err
+            raise TelegramError(msg)
         return data
 
     def _post_requests(self, method: str, fields: Dict[str, Any], files) -> Dict[str, Any]:
@@ -219,7 +238,8 @@ class TelegramClient:
                         except TelegramError as exc2:
                             exc = exc2
                     log.error("telegram send failed (%s): %s", chat, exc)
-                    results.append(SendResult(ok=False, chat_id=chat, error=str(exc)))
+                    results.append(SendResult(ok=False, chat_id=chat, error=str(exc),
+                                              permanent=isinstance(exc, TelegramPermanentError)))
         return results
 
     def send_photo(self, caption: str, photo_path: str, *, chat_id: Optional[str] = None,

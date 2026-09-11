@@ -235,11 +235,21 @@ intrabar."* That maps onto two distinct scanner modes:
 last completed bar in closed-bar mode, then unions the two event sets (deduped by `(kind, bar, zone)`). A delayed or
 partially-updated intraday feed therefore cannot make the scanner miss a signal the indicator printed at the close.
 
-**What "100% match" means here, precisely:** *identical logic on identical bars.* Verified by 18 hand-computed fixtures
-covering ATR seeding, warm-up `na` semantics, every zone method, origin search + fallback, entry math for all four
-front-run modes, all six entry modes, `minAge`, `requireDeparture`, one-tap-per-bar, adaptive entry, pending expiry,
-exhaustion ordering, sweep gating, duplicate veto, eviction, intrabar semantics and nearest-level bookkeeping. It does
-**not** mean identical *data* — see §10.
+**What "100% match" means here, precisely:** *identical logic on identical bars.* Verified two ways:
+
+1. **18 hand-computed fixtures** (`selftest.py`) covering ATR seeding, warm-up `na` semantics, every zone method,
+   origin search + fallback, entry math for all four front-run modes, all six entry modes, `minAge`,
+   `requireDeparture`, one-tap-per-bar, adaptive entry, pending expiry, exhaustion ordering, sweep gating, duplicate
+   veto, eviction, intrabar semantics and nearest-level bookkeeping.
+2. **A second, independent implementation.** `tests/pine_reference.py` is a fresh transliteration of
+   `INDICATOR.txt` — its own naive `ta.sma/rma/atr/highest/lowest`, its own parallel zone arrays, the same statement
+   order, written from the Pine source and sharing no code with `engine.py` or `series.py`.
+   `tests/test_pine_reference.py` runs both over five markets × 16 parameter sets × {closed bar, forming bar} and
+   requires agreement on the `plotshape` mask, all four `alertcondition` flags, the `nearestEntry`/`nearestStop`
+   plots, the surviving zone arrays and the full event stream. A transcription mistake in either direction shows up
+   as a diff naming the bar and the field.
+
+It does **not** mean identical *data* — see §10.
 
 ---
 

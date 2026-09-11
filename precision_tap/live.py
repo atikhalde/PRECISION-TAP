@@ -210,6 +210,24 @@ class LiveLoop:
         except Exception as exc:
             log.debug("retry pass failed: %s", exc)
         log.info("cycle %s → %s", tag, rep.summary_line)
+        # The summary line counts *found* signals, not delivered ones — a cycle
+        # that matched three taps and delivered none used to log exactly the same
+        # line as a healthy one, which is how "the scanner runs fine but Telegram
+        # is silent" stays invisible for a whole session.
+        d = rep.dispatch
+        if d is not None and not isinstance(d, dict):
+            log.info("cycle %s → delivery %s", tag, d)
+            if getattr(d, "undelivered", 0):
+                log.error("cycle %s: %d alert(s) did NOT reach Telegram — %s",
+                          tag, d.undelivered,
+                          " · ".join(dict.fromkeys(getattr(d, "errors", []) or []))[:300] or d)
+        elif d is not None:
+            log.info("cycle %s → %s", tag, d)
+        else:
+            log.info("cycle %s → nothing to send", tag)
+        for note in rep.notes:
+            if note.startswith(("DELIVERY PROBLEM", "NOT SENT", "nothing to send")):
+                log.warning("cycle %s: %s", tag, note)
         if self.on_scan is not None:
             try:
                 self.on_scan(rep)

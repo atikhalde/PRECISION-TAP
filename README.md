@@ -79,8 +79,14 @@ python -m precision_tap selftest          # 18 Pine-parity checks (offline, dete
 python -m precision_tap demo              # full offline pipeline on synthetic NSE-style data
 python tools/live_drill.py                # the LIVE path offline: fake Yahoo feed → mock Telegram
 python -m precision_tap scan --no-send    # one real cycle, prints instead of sending
+python -m precision_tap livecheck         # config → real Telegram → real feed → one real cycle
 python -m precision_tap verify RELIANCE.NS   # every zone + every event, for TradingView diffing
 ```
+
+`livecheck` is the answer to *"is it actually working on the live market?"*. It talks to the real
+Bot API and the real data provider, sends one test message, and prints a per-stage PASS/FAIL —
+so "no alert arrived" is never a guessing game again. A dry `scan --no-send` first is safe: those
+alerts are recorded as *not delivered*, so the next cycle with a working bot still sends them.
 
 `tools/live_drill.py` is the one that catches "it works on my machine but not on the market":
 it drives the real provider code (Yahoo chart API *and* yfinance, both faked) through the
@@ -106,6 +112,7 @@ Add `--end 2025-09-05 --start 2024-01-01 --bars-only 60` to zoom into a specific
 | `verify SYM` | full signal dump for one symbol (parity debugging) |
 | `alerts` | recent alerts + retry queue from the state DB |
 | `telegram-test` | ping / `--discover` the chat id |
+| `livecheck` | **end-to-end live check** — config → real Bot API round trip → real feed → one real cycle, and names the first thing that fails |
 | `export-data` | cache history to `data/csv/*.csv` for offline backtests (`--provider csv` to use it) |
 | `demo` / `selftest` / `doctor` / `init` | offline demo / parity checks / diagnostics / scaffolding |
 
@@ -251,6 +258,10 @@ precision_tap/
   cli.py        ← the commands above
 tests/          ← pytest: parity wrappers, yfinance adapter (fake), Telegram (local mock),
                   scanner/backtest, and the **live path** (feed freshness, scheduler, delivery)
+  pine_reference.py    ← a second, literal transcription of INDICATOR.txt (independent of
+                         engine.py/series.py) — the diff *is* the parity proof
+  test_pine_reference.py ← fuzzes engine ↔ transcription over 16 parameter sets × 5 markets
+  test_alert_delivery.py ← "ran fine, chat silent" regressions (ledger, 4xx, quiet-cycle notes)
 universe/nse.txt, config.example.yaml, deploy/
 tools/live_drill.py        ← offline rehearsal of the LIVE path (fake Yahoo feed + mock Bot API)
 tools/mock_telegram_server.py   ← local stand-in for api.telegram.org
@@ -259,9 +270,15 @@ tools/mock_telegram_server.py   ← local stand-in for api.telegram.org
 
 ## 9. Troubleshooting
 
+Run `python -m precision_tap livecheck` first — it walks config → Telegram → feed → one real
+cycle against the live market and prints `RESULT: PASS` or names the first thing that failed.
+
 | Symptom | Fix |
 |---|---|
 | `Telegram not configured` | `.env` needs `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; check `python -m precision_tap telegram-test` |
+| Ran fine, chat is silent, `sent=0 … skipped=N` | you looked at a dry cycle first (`scan --no-send`, or a run with no token). Those alerts are *logged, not delivered*, and the ledger marks them given-up rather than sent — the next cycle with a working bot still sends them. If you are on an older build, `DELETE FROM alerts WHERE sent=2;` in `data/state.sqlite3` clears them |
+| `DELIVERY PROBLEM — … 401 Unauthorized` / `400 chat not found` / `403 bot can't initiate…` | permanent Telegram rejection: the token is wrong, the chat id is wrong, or you never pressed **Start** on the bot (in a group, add it and make it an admin). It is logged at ERROR and *not* retried; fix the credential and the alert is re-offered on the next cycle |
+| `cycle … → delivery sent=0` in the log | the always-on loop now logs the delivery outcome separately from the signal count — a cycle that found three taps and delivered none no longer looks healthy |
 | No alerts at all, ever | the gates are strict by design: try `--set indicator.min_rvol=1.4 --set indicator.min_clv=0.65`, and check `alerts.min_liquidity_dollar_volume`/`min_price`; `verify SYM` shows what the engine sees |
 | `alerts matched: 0` but zones are found | read the `nothing to send — …` note at the end of the cycle: it tallies *why* every event was dropped (`illiquid 12 · event type disabled 6`). A quiet market plus a ₹500 crore turnover floor plus `tap1`-only often filters everything; `--min-dollar-volume 100` or `--events tap1,approach,confirmed,tap` widens it |
 | `scan --no-send` shows alerts but `run` sends nothing | `.env` is missing/unreadable, so `run` falls back to log-only. It says so once at startup and on every cycle; `doctor` prints the token/chat status |

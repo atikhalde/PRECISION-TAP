@@ -112,27 +112,55 @@ class StateStore:
             self._conn.commit()
 
     # ── alerts ───────────────────────────────────────────────────────────
+    #: values of the ``sent`` column
+    QUEUED = 0        # found, not delivered yet — a retry is owed
+    DELIVERED = 1     # on Telegram
+    GIVEN_UP = 2      # never delivered and no retry will help (no transport / 4xx)
+
     def seen(self, key: str) -> bool:
+        """Was this alert already delivered, or is a delivery still owed?
+
+        A row written by a cycle that *could not* deliver — ``scan --no-send``,
+        ``alerts.quiet_log_only``, a missing bot token, or a rejected one — sits
+        at ``GIVEN_UP``.  It must **not** count as seen: nothing reached the
+        user, so the first cycle that can talk to Telegram has to be allowed to
+        send it.  Counting it as seen is what makes the documented onboarding
+        order (``scan --no-send`` to look at the output, then ``run``) deliver
+        nothing for the rest of the session — every key is already "known".
+        """
         with self._lock:
-            row = self._conn.execute("SELECT 1 FROM alerts WHERE key = ?", (key,)).fetchone()
-        return row is not None
+            row = self._conn.execute("SELECT sent FROM alerts WHERE key = ?", (key,)).fetchone()
+        return row is not None and int(row["sent"]) != self.GIVEN_UP
 
     def record_alert(self, key: str, *, symbol: str, event: str, zone_id: Optional[int] = None,
                      bar_date: str = "", bar_time: str = "", level: float = float("nan"),
                      price: float = float("nan"), stop: float = float("nan"),
                      payload: Optional[Dict[str, Any]] = None, message: str = "",
                      sent: bool = False, error: str = "") -> bool:
-        """Insert a new alert row. Returns True if it is new (i.e. should be sent)."""
+        """Insert a new alert row. Returns True if it should be sent.
+
+        False means a *delivered* (or still-queued) row already exists.  A row
+        that was given up on is revived instead, so a cycle with a working
+        transport gets a second chance at it.
+        """
         now = utcnow()
+        blob = json.dumps(payload or {}, separators=(",", ":"), default=str)
         vals = (key, symbol, event, zone_id, bar_date, bar_time,
                 _f(level), _f(price), _f(stop), 1 if sent else 0, 1 if sent else 0,
-                error if not sent else "", json.dumps(payload or {}, separators=(",", ":"), default=str),
-                message, now, now)
+                error if not sent else "", blob, message, now, now)
         with self._lock:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO alerts (key, symbol, event, zone_id, bar_date, bar_time,"
                 " level, price, stop, sent, attempts, error, payload, message, created_at, updated_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
+            if not cur.rowcount:
+                cur = self._conn.execute(
+                    "UPDATE alerts SET symbol=?, event=?, zone_id=?, bar_date=?, bar_time=?,"
+                    " level=?, price=?, stop=?, sent=?, attempts=0, error=?, payload=?,"
+                    " message=?, updated_at=? WHERE key=? AND sent=?",
+                    (symbol, event, zone_id, bar_date, bar_time, _f(level), _f(price), _f(stop),
+                     1 if sent else 0, error if not sent else "", blob, message, now,
+                     key, self.GIVEN_UP))
             self._conn.commit()
         return bool(cur.rowcount)
 
