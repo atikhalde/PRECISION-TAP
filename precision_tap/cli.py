@@ -10,6 +10,7 @@
   zones           watchlist table: nearest live OB level per symbol
   alerts          recent alerts from the state db
   telegram-test   ping the bot (with --discover to find your chat id)
+  livecheck       end-to-end live check: config -> Telegram -> feed -> one real cycle
   export-data     cache history to CSV for offline backtesting
   demo            end-to-end offline demo on synthetic NSE-style data
   selftest        Pine-parity checks (no network needed)
@@ -220,7 +221,7 @@ def cmd_verify(args) -> int:
     df = bars.df
     if args.start:
         df = df.loc[pd.Timestamp(args.start):]
-    res = run_engine(df, p, symbol=args.symbol, intrabar_last=False, zone_cap=10 ** 6)
+    res = run_engine(df, p, symbol=args.symbol, intrabar_last=False)
     print(f"{args.symbol} · {cfg.data.interval} · {len(df)} bars · {df.index[0].date()} → "
           f"{df.index[-1].date()} · mintick {p.mintick} · provider {bars.source}")
     print(f"\nzones ({len(res.zones)} created, {len(res.live_zones)} still live)")
@@ -257,7 +258,10 @@ def cmd_verify(args) -> int:
 
 def cmd_scan(args) -> int:
     cfg = _cfg(args)
-    dry = bool(args.no_send) or not (cfg.telegram.bot_token and cfg.telegram.chat_ids)
+    # same contract as `run`: with no working transport, log the alerts instead
+    # of parking them in a retry queue that can never drain
+    dry = bool(args.no_send) or not (cfg.telegram.enabled and cfg.telegram.bot_token
+                                     and cfg.telegram.chat_ids)
     with _store(cfg) as store:
         sc = _scanner(cfg, dry_run=dry, store=store)
         if args.retried:
@@ -504,6 +508,134 @@ def cmd_telegram(args) -> int:
     return 0 if all(r.ok for r in res) else 1
 
 
+def cmd_livecheck(args) -> int:
+    """End-to-end live-market check: config → Telegram → market feed → one real cycle.
+
+    "The scanner runs but Telegram is silent" has exactly four possible causes,
+    and they are in four different places.  This walks all four in order and
+    names the first one that fails, against the *real* market and the *real*
+    bot — nothing here is mocked.
+    """
+    cfg = _cfg(args)
+    probe = ([s for s in args.symbols if s] if getattr(args, "symbols", None)
+             else (cfg.data.universe or read_universe(cfg.data.universe_file,
+                                                      suffix=cfg.data.symbol_suffix))[:args.probe])
+    open_now = _market_open(cfg.live.market_timezone,
+                            session=(cfg.live.session_open, cfg.live.session_close))
+    print(BANNER + "\n")
+    failures: List[str] = []
+
+    def stage(title: str) -> None:
+        print(f"\n── {title} " + "─" * max(0, 58 - len(title)))
+
+    # ── 1. configuration ──────────────────────────────────────────────────
+    stage("1 · configuration")
+    print(f"provider          {cfg.data.provider} · {cfg.data.interval} · suffix {cfg.data.symbol_suffix}")
+    print(f"universe          {len(probe)} probe symbol(s): {', '.join(probe[:6])}"
+          + (" …" if len(probe) > 6 else ""))
+    print(f"alert events      {cfg.alert.events} · recent_bars={cfg.alert.recent_bars} · "
+          f"liquidity floor {_fmt(cfg.alert.min_liquidity_dollar_volume / 1e7, 0)}cr · "
+          f"min_price {_fmt(cfg.alert.min_price)}")
+    print(f"market            {cfg.live.market_timezone} {cfg.live.session_open}–"
+          f"{cfg.live.session_close} → {'OPEN' if open_now else 'CLOSED'}")
+    if not cfg.telegram.enabled:
+        failures.append("telegram.enabled is false — nothing will ever be sent")
+        print("telegram          DISABLED by config")
+    elif not (cfg.telegram.bot_token and cfg.telegram.chat_ids):
+        failures.append("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing (.env)")
+        print("telegram          token/chat MISSING → alerts are logged, never delivered")
+    else:
+        print(f"telegram          token {cfg.telegram.bot_token.split(':')[0]}:… · "
+              f"{len(cfg.telegram.chat_ids)} chat id(s)")
+
+    # ── 2. Telegram round trip ────────────────────────────────────────────
+    stage("2 · Telegram round trip (real Bot API)")
+    tg_ok = False
+    if cfg.telegram.enabled and cfg.telegram.bot_token and cfg.telegram.chat_ids:
+        tg = TelegramClient(cfg.telegram)
+        try:
+            me = tg.get_me()
+            print(f"  getMe           ok — @{me.get('username')} ({me.get('first_name')})")
+        except Exception as exc:
+            failures.append(f"getMe failed — bad token, or no route to api.telegram.org: {exc}")
+            print(f"  getMe           FAIL {exc}")
+        if not args.no_message:
+            try:
+                res = tg.send_text("🔎 <b>Precision Tap livecheck</b> — transport test. "
+                                   "If you can read this, delivery works.")
+                for r in res:
+                    if r.ok:
+                        print(f"  sendMessage     ok — msg_id={r.message_id} chat {r.chat_id}")
+                    else:
+                        print(f"  sendMessage     FAIL chat {r.chat_id}: {r.error}")
+                        failures.append(f"Telegram rejected the message: {r.error}")
+                tg_ok = bool(res) and all(r.ok for r in res)
+            except Exception as exc:
+                failures.append(f"Telegram send failed: {exc}")
+                print(f"  sendMessage     FAIL {exc}")
+        else:
+            print("  sendMessage     skipped (--no-message)")
+    else:
+        print("  skipped — no bot token / chat id")
+
+    # ── 3. market feed ────────────────────────────────────────────────────
+    stage("3 · market feed (real provider)")
+    src = DataSource(cfg.data, live=open_now)
+    feed_live = 0
+    for sym in probe[:6]:
+        t0 = time.time()
+        b = src.get(sym, use_cache=not args.no_cache)
+        if not b.ok:
+            failures.append(f"{sym}: no data — {b.error}")
+            print(f"  {sym:<16} FAIL {str(b.error)[:110]}")
+            continue
+        print(f"  {sym:<16} {len(b.df):>5} bars · last {b.df.index[-1].date()} · "
+              f"close {b.df['close'].iloc[-1]:,.2f} · live={b.live} · {b.source} "
+              f"({time.time() - t0:.1f}s)")
+        feed_live += int(bool(b.live))
+    src.close()
+    if open_now and feed_live == 0:
+        failures.append("the market is OPEN but no symbol returned today's forming bar — "
+                        "a live cycle would skip every symbol")
+        print("  ⚠ no live (forming) bar while the session is open")
+    elif not open_now:
+        print("  market closed — closed-bar mode; a forming bar is not expected")
+
+    # ── 4. one real scan cycle ────────────────────────────────────────────
+    stage("4 · one real scan cycle → Telegram")
+    with _store(cfg) as store:
+        sc = _scanner(cfg, dry_run=not tg_ok and not args.no_message, store=store)
+        rep = sc.scan(symbols=probe, live=None, send=True, progress=False)
+        print(f"  {rep.summary_line}")
+        print(f"  events in window {rep.events_in_window} · filtered {rep.filtered} · "
+              f"skipped symbols {rep.skipped_symbols}")
+        for st, ev in rep.alerts[:10]:
+            print("   • " + ev.fmt())
+        if rep.dispatch is not None and not isinstance(rep.dispatch, dict):
+            print(f"  delivery: {rep.dispatch}")
+            if getattr(rep.dispatch, "undelivered", 0):
+                failures.append(f"{rep.dispatch.undelivered} alert(s) found but not delivered — "
+                                f"see the errors above")
+        for note in rep.notes:
+            if note.startswith(("DELIVERY PROBLEM", "NOT SENT", "nothing to send", "also filtered")):
+                print(f"  note: {note}")
+        if rep.alerts and tg_ok:
+            print(f"  ✅ {len(rep.alerts)} alert(s) delivered — check the chat")
+        elif not rep.alerts and not failures:
+            print("  ℹ no signal in this window — that is a quiet market, not a broken scanner. "
+                  "Widen it with --recent-bars 3 --events tap1,tap,approach,confirmed")
+        sc.close()
+
+    print("\n" + ("=" * 62))
+    if failures:
+        print("RESULT: FAIL")
+        for f in failures:
+            print("  ✗ " + f)
+        return 1
+    print("RESULT: PASS — transport, feed and scanner all healthy")
+    return 0
+
+
 def cmd_export(args) -> int:
     cfg = _cfg(args)
     uni = cfg.data.universe or read_universe(cfg.data.universe_file, suffix=cfg.data.symbol_suffix)
@@ -683,6 +815,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=25.0)
     p.add_argument("--text", default=None)
     p.set_defaults(fn=cmd_telegram)
+
+    p = sub.add_parser("livecheck",
+                       help="end-to-end live check: config → Telegram → feed → one real cycle")
+    _common(p); _data_opts(p)
+    p.add_argument("--probe", type=int, default=6, help="how many universe symbols to probe")
+    p.add_argument("--no-message", action="store_true", help="do not send the transport test ping")
+    p.add_argument("--no-cache", action="store_true")
+    p.set_defaults(fn=cmd_livecheck)
 
     p = sub.add_parser("export-data", help="cache history to CSV for offline runs")
     _common(p); _data_opts(p)

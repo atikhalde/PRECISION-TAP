@@ -251,13 +251,24 @@ class DispatchResult:
     skipped: int = 0
     failed: int = 0
     messages: List[str] = None  # type: ignore[assignment]
+    errors: List[str] = None    # type: ignore[assignment]
 
     def __post_init__(self) -> None:
         if self.messages is None:
             self.messages = []
+        if self.errors is None:
+            self.errors = []
 
     def __str__(self) -> str:
-        return (f"sent={self.sent} queued={self.queued} skipped={self.skipped} failed={self.failed}")
+        out = (f"sent={self.sent} queued={self.queued} skipped={self.skipped} failed={self.failed}")
+        if self.errors:
+            out += " | " + " · ".join(dict.fromkeys(self.errors))
+        return out
+
+    @property
+    def undelivered(self) -> int:
+        """Alerts that were found but never reached Telegram."""
+        return int(self.queued) + int(self.failed)
 
 
 class AlertDispatcher:
@@ -340,14 +351,26 @@ class AlertDispatcher:
                 if self.store is not None:
                     self.store.mark(key, sent=False, error=str(exc))
                 res.queued += 1
+                res.errors.append(f"{ev.symbol}: {exc}"[:220])
                 res.messages.append({"symbol": ev.symbol, "kind": name, "text": text})
                 continue
             ok = bool(results) and all(r.ok for r in results)
             err = "; ".join(r.error for r in results if r.error)[:400]
+            # A 401/400/403 will not heal by waiting: retrying it six times only
+            # hides it.  Park it as given-up (so it is *not* deduped away from a
+            # later, fixed run) and say so loudly.
+            permanent = bool(results) and any(getattr(r, "permanent", False) for r in results)
             if self.store is not None:
                 self.store.mark(key, sent=ok, error="" if ok else err)
+                if not ok and permanent:
+                    self.store.give_up([key])
             res.sent += 1 if ok else 0
             res.failed += 0 if ok else 1
+            if not ok:
+                res.errors.append(f"{ev.symbol}: {err or 'telegram rejected the message'}"[:220])
+                if permanent:
+                    log.error("telegram permanently rejected the alert for %s — %s "
+                              "(fix the token/chat id; nothing will be retried)", ev.symbol, err)
             res.messages.append({"symbol": ev.symbol, "kind": name, "text": text, "ok": ok})
         return res
 

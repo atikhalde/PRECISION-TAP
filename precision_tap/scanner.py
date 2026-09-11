@@ -116,6 +116,9 @@ class ScanReport:
     errors: int = 0
     symbols_with_zones: int = 0
     events_total: int = 0
+    events_in_window: int = 0            # events inside `alerts.recent_bars`
+    filtered: int = 0                    # …of those, rejected by the alert filters
+    skipped_symbols: int = 0             # …symbols dropped before evaluation (stale/no bar)
     alerts: List[Tuple[SymbolScan, Event]] = field(default_factory=list)
     rows: List[SymbolScan] = field(default_factory=list)
     dispatch: Any = None
@@ -126,6 +129,9 @@ class ScanReport:
             "started_at": self.started_at, "finished_at": self.finished_at, "mode": self.mode,
             "universe": self.universe, "usable": self.usable, "errors": self.errors,
             "symbols_with_zones": self.symbols_with_zones, "events_total": self.events_total,
+            "events_in_window": self.events_in_window, "filtered": self.filtered,
+            "skipped_symbols": self.skipped_symbols,
+            "delivery": str(self.dispatch) if self.dispatch is not None else "",
             "alerts": [
                 {"symbol": s.symbol, "event": event_name(e), "tap_no": e.tap_no,
                  "bar": e.bar, "date": str(e.ts), "level": e.level, "price": e.price,
@@ -290,16 +296,22 @@ class Scanner:
             # so produces a plausible-looking alert with yesterday's price — the
             # exact failure mode behind "the scanner ran but Telegram was quiet".
             if requested_live and self._tracks_live_market() and not b.live:
+                rep.skipped_symbols += 1
+                dropped["no live bar"] = dropped.get("no live bar", 0) + 1
                 rep.notes.append(f"{sym}: live bar unavailable (last {st.last_date}) — skipped")
                 continue
             if st.stale and self.cfg.alert.skip_stale_bars:
+                rep.skipped_symbols += 1
+                dropped["stale bar"] = dropped.get("stale bar", 0) + 1
                 rep.notes.append(f"{sym}: last bar {st.last_date} is not today's session — skipped")
                 continue
             rep.usable += 1
             if st.nearest_zone is not None:
                 rep.symbols_with_zones += 1
             rep.events_total += len(st.actionable)
-            for ev in self._recent_events(st, live=actual_live):
+            window = self._recent_events(st, live=actual_live)
+            rep.events_in_window += len(window)
+            for ev in window:
                 ctx = self._context(st, ev)
                 ok, why = passes_filters(ev, ctx, cfg.alert,
                                          already_seen=(lambda e: self.store.seen(dedupe_key(e, cfg.alert)))
@@ -307,20 +319,44 @@ class Scanner:
                 if ok:
                     items.append((st, ev, ctx))
                 else:
+                    rep.filtered += 1
                     dropped[_skip_bucket(why)] = dropped.get(_skip_bucket(why), 0) + 1
                     log.debug("skip %s %s: %s", sym, event_name(ev), why)
         # highest-value signal first, then alphabetical — the same order Telegram sees
         items.sort(key=lambda ic: (event_rank(ic[1]), ic[1].symbol))
         rep.alerts = [(st, ev) for st, ev, _ in items]
-        if dropped:
-            # "why did nothing fire?" is the first question after every quiet cycle
-            tally = " · ".join(f"{why} {n}" for why, n in
-                               sorted(dropped.items(), key=lambda kv: (-kv[1], kv[0])))
-            rep.notes.append("nothing to send — " + tally if not items else "also filtered — " + tally)
+        tally = " · ".join(f"{why} {n}" for why, n in
+                           sorted(dropped.items(), key=lambda kv: (-kv[1], kv[0])))
+        if not items:
+            # "why did nothing fire?" is the first question after every quiet
+            # cycle, and silence is indistinguishable from a broken pipeline
+            # unless the cycle says which it was.
+            if rep.events_in_window == 0 and not tally:
+                rep.notes.append(
+                    f"nothing to send — no indicator signal in the last "
+                    f"{max(1, int(cfg.alert.recent_bars))} bar(s) of {rep.usable} usable symbol(s) "
+                    f"({rep.symbols_with_zones} with a live zone); gates not met or a quiet session")
+            else:
+                rep.notes.append("nothing to send — " + (tally or "no events in the alert window"))
+        elif tally:
+            rep.notes.append("also filtered — " + tally)
         if send and items:
             rep.dispatch = self.dispatcher.dispatch([(ev, ctx) for _, ev, ctx in items])
         elif items:
             rep.dispatch = {"would_send": len(items)}
+        # A cycle that found signals but delivered none is the failure the user
+        # actually experiences ("it ran, Telegram was silent"), so it is reported
+        # in the notes and in the log — not only in a debug line.
+        d = rep.dispatch
+        if d is not None and not isinstance(d, dict):
+            if getattr(d, "undelivered", 0):
+                detail = " · ".join(dict.fromkeys(getattr(d, "errors", []) or []))[:300]
+                rep.notes.append(f"DELIVERY PROBLEM — {d}")
+                log.error("cycle found %d alert(s) but %d did not reach Telegram: %s",
+                          len(items), d.undelivered, detail or d)
+            elif not self.dispatcher.deliverable:
+                rep.notes.append(f"NOT SENT — no working Telegram transport ({d}); "
+                                 "set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID in .env")
         rep.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         rep.notes.append(f"{time.time() - t_start:.1f}s")
         if self.store and run_id:
@@ -373,7 +409,11 @@ class Scanner:
         st.stale = (not historical and self._tracks_live_market()
                     and _is_stale_bar(df.index[-1], self.cfg.live.market_timezone,
                                       strict=requested_live))
-        res = run_engine(df, p, symbol=symbol, intrabar_last=live, zone_cap=10 ** 6)
+        # No `zone_cap` override: the Pine script evicts the oldest box once
+        # `maxZones` is exceeded, so a scanner that keeps every zone it has ever
+        # seen evaluates taps on boxes TradingView has already thrown away and
+        # cannot claim to match the indicator.
+        res = run_engine(df, p, symbol=symbol, intrabar_last=live)
         st.result, st.df, st.events = res, df, res.events
         # Closed-bar parity pass.  On the forming bar the engine deliberately
         # creates no zone and confirms no defence (that is what makes an intraday
@@ -382,7 +422,7 @@ class Scanner:
         # would already have printed — including every `confirmed`, which can
         # never come from the intrabar pass.
         if live and self.cfg.alert.match_indicator_100:
-            closed = run_engine(df, p, symbol=symbol, intrabar_last=False, zone_cap=10 ** 6)
+            closed = run_engine(df, p, symbol=symbol, intrabar_last=False)
             st.events_closed = [e for e in closed.events if not e.intrabar]
         A = res.arrays
         i = len(df) - 1
