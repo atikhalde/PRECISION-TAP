@@ -8,5 +8,8 @@ venv/
 data/
 results*/
 logs/
+# scratch files written by .github/workflows/live-scan.yml
+scan-output.txt
+digest.txt
 .pytest_cache/
 .DS_Store
