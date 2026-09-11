@@ -171,6 +171,42 @@ your last two post-close `scan_times`, or the "settled bar" scan just re-reads t
 **systemd** (`deploy/systemd/precision-tap.service`), **Docker/compose** (`deploy/`) and a
 **cron** variant (`--once`) are included — see `deploy/README.md`.
 
+### Hosted alternative: GitHub Actions
+
+If you would rather not run a server, [`.github/workflows/live-scan.yml`](.github/workflows/live-scan.yml)
+runs the same scanner on GitHub's runners against the real market and posts to the same chat.
+Add two repository secrets and it is live:
+
+| Secret / variable | Value |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` *(secret)* | from [@BotFather](https://t.me/BotFather) |
+| `TELEGRAM_CHAT_ID` *(secret)* | `python -m precision_tap telegram-test --discover` |
+| `SCAN_LIMIT` *(variable, optional)* | cap the universe to the first N symbols while you tune |
+| `SCAN_SYMBOLS` *(variable, optional)* | ad-hoc universe, e.g. `RELIANCE,TCS,INFY` |
+| `SCAN_EVENTS` *(variable, optional)* | e.g. `tap1` to cut the volume |
+| `SCAN_MIN_DV` *(variable, optional)* | 20d median turnover floor in ₹ crore |
+
+It fires every 15 minutes across the NSE session plus four post-close scans (29 runs per weekday,
+09:15–17:00 IST), and you can also start one by hand from the **Actions** tab with a forced
+`live`/`eod` mode and a dry-run toggle. Each run picks its mode from the exchange clock exactly as
+`scan` does, so a UTC runner behaves like an `Asia/Kolkata` host.
+
+Two things to know before you rely on it:
+
+* **The dedupe ledger is carried between runs with `actions/cache`.** Runners are ephemeral, and
+  `data/state.sqlite3` is the only thing that stops the same Tap 1 being re-sent every 15 minutes.
+  A cache miss is survivable but re-delivers that day's alerts once — the run says so in a
+  `::warning::` annotation rather than failing silently.
+* **GitHub's cron is best-effort.** The documented floor is 5 minutes and starts are frequently
+  delayed 5–15 minutes, longer at the top of the hour; a run can be skipped entirely under load.
+  A delayed intraday cycle simply lands in closed-bar mode (still correct, just later). For
+  alerts you must not miss, prefer the systemd/Docker loop above — this workflow is the
+  zero-maintenance option, not the lowest-latency one.
+
+A failing run posts to Telegram, and the 17:00 IST cycle posts an end-of-day digest so a quiet
+market is visibly different from a dead pipeline.
+
+
 ## 7. Backtesting
 
 ```bash
@@ -208,6 +244,7 @@ precision_tap/
 tests/          ← pytest: parity wrappers, yfinance adapter (fake), Telegram (local mock),
                   scanner/backtest, and the **live path** (feed freshness, scheduler, delivery)
 universe/nse.txt, config.example.yaml, tools/mock_telegram_server.py, deploy/
+.github/workflows/   ← ci.yml (offline parity + tests) and live-scan.yml (real market → Telegram)
 ```
 
 ## 9. Troubleshooting

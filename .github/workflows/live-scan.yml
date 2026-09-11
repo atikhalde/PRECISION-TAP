@@ -1,0 +1,293 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Live scanner — real NSE/BSE data (yfinance) → Telegram alerts
+#
+# The *live* counterpart to ci.yml, which only ever runs `demo` on synthetic
+# data.  Every run here talks to the real market and delivers to a real chat.
+#
+#   secrets.TELEGRAM_BOT_TOKEN   from @BotFather
+#   secrets.TELEGRAM_CHAT_ID     `python -m precision_tap telegram-test --discover`
+#   vars.SCAN_LIMIT      (opt)   cap the universe to the first N symbols
+#   vars.SCAN_SYMBOLS    (opt)   ad-hoc universe, e.g. "RELIANCE,TCS,INFY"
+#   vars.SCAN_EVENTS     (opt)   e.g. "tap1" or "tap1,approach,confirmed"
+#   vars.SCAN_MIN_DV     (opt)   20d median turnover floor, ₹ crore
+#
+# Schedules are UTC (GitHub cron is always UTC).  NSE 09:15–15:30 IST is
+# 03:45–10:00 UTC.  The scanner picks intraday-vs-closed-bar mode from the
+# exchange clock itself — `_market_open` resolves ZoneInfo(live.market_timezone),
+# so a UTC runner behaves exactly like an Asia/Kolkata host.
+#
+# ⚠ Dedupe lives in data/state.sqlite3.  Runners are ephemeral, so that file is
+#   carried between runs with actions/cache.  Without it every cycle would
+#   re-send the same Tap 1 — the cache steps are load-bearing, not cosmetic.
+# ══════════════════════════════════════════════════════════════════════════════
+name: Live scanner
+
+on:
+  schedule:
+    # ── intraday: every 15 min across the NSE session (09:15–15:30 IST) ──
+    - cron: "45 3 * * 1-5"      # 09:15 IST  session open
+    - cron: "*/15 4-9 * * 1-5"  # 09:30–15:15 IST
+    - cron: "0 10 * * 1-5"      # 15:30 IST  session close
+    # ── post-close: closed-bar prints (indicator-exact) ──
+    - cron: "5 10 * * 1-5"      # 15:35 IST  closing print
+    - cron: "40 10 * * 1-5"     # 16:10 IST  settled EOD bar
+    - cron: "30 11 * * 1-5"     # 17:00 IST  settled + end-of-day digest
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Scan mode (auto follows the exchange clock)"
+        type: choice
+        options: [auto, live, eod]
+        default: auto
+      symbols:
+        description: "Ad-hoc universe, comma separated (blank = config universe)"
+        required: false
+        default: ""
+      limit:
+        description: "Cap universe to first N symbols (0 = all)"
+        required: false
+        default: "0"
+      dry_run:
+        description: "Dry run — compute and log, never send to Telegram"
+        type: boolean
+        default: false
+
+# Every run shares one SQLite ledger.  Serialise them so two cycles can never
+# race on the cache.  cancel-in-progress:false keeps a queued cycle rather than
+# dropping it — a dropped intraday cycle is a missed tap.
+concurrency:
+  group: precision-tap-live-scan
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Kolkata          # readable log stamps; the scanner is tz-aware regardless
+  PYTHONUNBUFFERED: "1"
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+jobs:
+  live-scan:
+    name: Live market scan → Telegram
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      # ── dedupe ledger ───────────────────────────────────────────────────────
+      # restore-keys picks the newest `precision-tap-state-*`, i.e. the previous
+      # cycle.  A miss is survivable (the file is recreated) but it means
+      # today's alerts can fire again, so it is reported loudly.
+      # Only the ledger is restored — never data/cache, or a cycle would be
+      # handed yesterday's frames and read a stale price as the live one.
+      - name: Restore scanner state (alert ledger)
+        id: state
+        uses: actions/cache/restore@v4
+        with:
+          path: data/state.sqlite3
+          key: precision-tap-state-${{ github.run_id }}
+          restore-keys: precision-tap-state-
+
+      - name: Inspect restored ledger
+        run: |
+          if [ "${{ steps.state.outputs.cache-hit }}" != "true" ]; then
+            echo "::warning::No prior ledger restored — empty dedupe set, so alerts already sent today may be re-delivered once."
+            exit 0
+          fi
+          python - <<'PY'
+          import sqlite3
+          try:
+              c = sqlite3.connect("data/state.sqlite3")
+              n, d = c.execute("SELECT COUNT(*), COUNT(DISTINCT symbol) FROM alerts").fetchone()
+              print(f"ledger restored: {n} known alert key(s) across {d} symbol(s)")
+          except Exception as exc:
+              print(f"::warning::ledger unreadable ({exc}) — treating as empty")
+          PY
+
+      # ── credentials ─────────────────────────────────────────────────────────
+      # A missing secret must fail the job, not degrade it.  cmd_scan flips to
+      # dry-run when the token is empty, so an unconfigured repo would otherwise
+      # print a healthy-looking log forever while delivering nothing.
+      - name: Check Telegram credentials
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          missing=""
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then missing="$missing TELEGRAM_BOT_TOKEN"; fi
+          if [ -z "$TELEGRAM_CHAT_ID" ]; then missing="$missing TELEGRAM_CHAT_ID"; fi
+          if [ -n "$missing" ]; then
+            echo "::error::Missing secret(s):$missing"
+            echo "Set them under Settings → Secrets and variables → Actions."
+            echo "Find your chat id with:  python -m precision_tap telegram-test --discover"
+            exit 1
+          fi
+          echo "Telegram token and chat id present"
+
+      # getMe authenticates the token without sending anything.  A "starting"
+      # ping here would mean ~29 messages a day of pure noise.
+      - name: Verify bot token (getMe)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        run: |
+          python - <<'PY'
+          import sys
+          from precision_tap.config import load_config
+          from precision_tap.telegram import TelegramClient
+          cfg = load_config()
+          try:
+              me = TelegramClient(cfg.telegram).get_me()
+          except Exception as exc:
+              print(f"::error::getMe failed — is TELEGRAM_BOT_TOKEN valid? {exc}")
+              sys.exit(1)
+          print(f"bot @{me.get('username')} reachable · chat(s) {cfg.telegram.chat_ids}")
+          PY
+
+      # ── the scan ────────────────────────────────────────────────────────────
+      # No --live/--eod: `scan` asks _market_open and rebuilds today's bar from
+      # 5m ticks during the session, settled bars after it.  --retried drains
+      # whatever a previous cycle queued behind a Telegram outage.
+      - name: Run live scan (yfinance → Telegram)
+        id: scan
+        run: |
+          ARGS=(scan --retried --top 40)
+
+          case "${{ inputs.mode || 'auto' }}" in
+            live) ARGS+=(--live) ;;
+            eod)  ARGS+=(--eod)  ;;
+          esac
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS+=(--no-send)
+          fi
+
+          LIMIT="${{ vars.SCAN_LIMIT || inputs.limit || '0' }}"
+          if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then
+            ARGS+=(--limit "$LIMIT")
+          fi
+
+          SYMS="${{ vars.SCAN_SYMBOLS || inputs.symbols }}"
+          if [ -n "$SYMS" ]; then
+            # shellcheck disable=SC2206
+            ARR=(${SYMS//,/ })
+            ARGS+=(-S "${ARR[@]}")
+          fi
+
+          if [ -n "${{ vars.SCAN_EVENTS }}" ]; then
+            ARGS+=(--events "${{ vars.SCAN_EVENTS }}")
+          fi
+          if [ -n "${{ vars.SCAN_MIN_DV }}" ]; then
+            ARGS+=(--min-dollar-volume "${{ vars.SCAN_MIN_DV }}")
+          fi
+
+          echo "::group::python -m precision_tap ${ARGS[*]}"
+          set +e
+          python -m precision_tap "${ARGS[@]}" 2>&1 | tee scan-output.txt
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "::endgroup::"
+          exit "$rc"
+
+      # ── end-of-day digest ───────────────────────────────────────────────────
+      # "Silence ≠ no signals": the 17:00 IST cycle posts what happened, so a
+      # quiet day is visibly different from a dead pipeline.  Keyed on the cron
+      # string, which is exact — no clock arithmetic to drift.
+      - name: Post end-of-day digest
+        if: ${{ always() && steps.scan.outcome == 'success' && github.event_name == 'schedule' && github.event.schedule == '30 11 * * 1-5' }}
+        run: |
+          python - <<'PY' > digest.txt
+          import sqlite3, datetime
+          c = sqlite3.connect("data/state.sqlite3")
+          c.row_factory = sqlite3.Row
+          today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+          rows = c.execute(
+              "SELECT symbol, event, sent FROM alerts "
+              "WHERE substr(created_at,1,10) = ? ORDER BY created_at", (today,)).fetchall()
+          run = c.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+          kinds = {}
+          for r in rows:
+              kinds[r["event"]] = kinds.get(r["event"], 0) + 1
+          sent = sum(1 for r in rows if r["sent"] == 1)
+          queued = sum(1 for r in rows if r["sent"] == 0)
+          out = [f"\U0001F5D3 <b>Precision Tap · end of day {today}</b>"]
+          if rows:
+              acc = " · ".join(f"{k} {v}" for k, v in sorted(kinds.items()))
+              out.append(f"{len(rows)} alert(s): {acc}")
+              out.append(f"delivered {sent} · queued {queued}")
+              out.append("")
+              for r in rows[-15:]:
+                  mark = {1: "✅", 0: "⏳", 2: "⛔"}.get(r["sent"], "•")
+                  out.append(f"{mark} <code>{r['symbol']}</code> {r['event']}")
+          else:
+              out.append("No signals fired today — gates not met, or a market holiday.")
+          if run:
+              out.append("")
+              out.append(f"<i>last cycle {run['mode']} · universe {run['symbols']} · "
+                         f"usable {run['usable']} · errors {run['errors']}</i>")
+          print("\n".join(out))
+          PY
+          python -m precision_tap telegram-test --text "$(cat digest.txt)"
+
+      # ── persist the ledger ──────────────────────────────────────────────────
+      # WAL sidecar files would be lost with the runner, so fold them back into
+      # the main file before it is cached.
+      - name: Checkpoint SQLite WAL
+        if: always()
+        run: |
+          if [ ! -f data/state.sqlite3 ]; then
+            echo "no ledger to checkpoint"
+            exit 0
+          fi
+          python - <<'PY'
+          import sqlite3
+          c = sqlite3.connect("data/state.sqlite3")
+          c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+          c.close()
+          print("WAL checkpointed into data/state.sqlite3")
+          PY
+
+      - name: Save scanner state (alert ledger)
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: data/state.sqlite3
+          key: precision-tap-state-${{ github.run_id }}
+
+      # ── observability ───────────────────────────────────────────────────────
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-scan-${{ github.run_number }}
+          path: |
+            scan-output.txt
+            results/
+            logs/
+            data/state.sqlite3
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ── failure notice ──────────────────────────────────────────────────────
+      # A broken scanner is worse than a quiet one.  continue-on-error so this
+      # never masks the original failure.
+      - name: Notify Telegram on failure
+        if: ${{ failure() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
+        continue-on-error: true
+        run: |
+          python -m precision_tap telegram-test --text "⚠️ <b>Precision Tap live scan failed</b>
+          run <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">#${{ github.run_number }}</a> · ${{ github.event_name }}
+          check the workflow log for the traceback."
