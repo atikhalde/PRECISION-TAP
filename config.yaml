@@ -1,0 +1,135 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Precision Tap — NSE/BSE daily scanner + backtest
+# 1:1 port of "Institutional OB — Precision Tap & Pre-Order" (INDICATOR.txt)
+# Every key under `indicator:` is the TradingView input with the same default.
+# Secrets come from .env (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID).
+# ══════════════════════════════════════════════════════════════════════════════
+
+data:
+  provider: yfinance            # yfinance (live) | yahoo (chart API) | csv (offline) | synthetic
+  # NOTE: market must be NSE or BSE and interval must be 1d — enforced at startup.
+  interval: 1d                  # daily TF only — the indicator is designed for it
+  market: NSE                   # NSE | BSE (label shown in alerts)
+  symbol_suffix: ".NS"          # RELIANCE -> RELIANCE.NS ; use ".BO" for BSE
+  universe_file: universe/nse.txt   # or: nifty50 | nifty100 | nifty200 | nifty500 | sensex30
+  lookback_days: 900            # history per symbol (>= 200 recommended for ATR/volume context)
+  min_bars: 150                 # symbols with less history are skipped
+  live_intraday_bar: true       # rebuild today's forming bar from 5m ticks (needed for touch alerts)
+  intraday_interval: 5m
+  corporate_adjustments: true    # back-adjusted prices (splits/dividends), like TradingView
+  cache_dir: data/cache
+  cache_max_age_minutes: 5       # during the session: refetch after 5 min
+  eod_cache_max_age_minutes: 1440
+  rate_limit_per_sec: 5          # be nice to Yahoo/NSE endpoints
+  retry_max: 3
+  tick_sizes:                  # syminfo.mintick per market (drives Ticks front-run + Distal+1 tick)
+    ".NS": 0.05
+    ".BO": 0.05
+
+# ── 1 — Volume-confirmed displacement ────────────────────────────────────────
+indicator:
+  vol_len: 20                  # "Local volume average"  (20-day SMA of volume for RVOL)
+  atr_len: 14                  # ATR length (Wilder/RMA, Pine-exact seeding)
+  min_rvol: 1.8                # displacement needs >= 1.8x local average volume
+  min_range_atr: 1.20          # range >= 1.20 x ATR
+  min_body_frac: 0.55          # bullish body >= 55% of the bar range
+  min_clv: 0.72                # close in the top 28% of the bar (close-location value)
+  structure_len: 8             # close must break the 8-bar high  (high[1..8])
+  origin_search: 8             # search back up to 8 bars for the origin candle
+  allow_neutral_origin: true   # accept a small neutral candle as origin
+  neutral_body: 0.20           # neutral = |close-open| / range <= 0.20
+  # ── 2 — Exact order-block zone ──
+  zone_method: "Open to low"   # Open to low | Body to low | Body only | Lower half of candle
+  entry_mode: "Proximal"       # Proximal | 50% | 62% | 70.5% | 79% | Distal + 1 tick
+  frontrun_mode: "Auto"        # Auto | ATR | Ticks | Off  (buy level sits just ABOVE the OB edge)
+  frontrun_atr: 0.18
+  frontrun_ticks: 2
+  max_zone_buffer: 0.40        # Auto buffer capped at 40% of zone width
+  entry_offset_ticks: 0
+  stop_atr: 0.15               # stop = zone bottom - 0.15 x ATR
+  approach_atr: 0.25           # pre-alert distance above the entry
+  min_age: 3                   # a zone must be >= 3 bars old before its first tap
+  max_zones: 30
+  max_touches: 4               # 5th tap => exhausted (the 5th tap is still recorded, as in Pine)
+  raise_after_first_tap: true  # after Tap 1 lift the next pre-order above the defended low
+  repeat_tap_atr: 0.05
+  require_departure: 1.0       # price must first leave 1.0 x ATR above the OB before taps count
+  # ── 3 — Optional defence confirmation ──
+  confirm_bars: 3
+  confirm_rvol: 1.3
+  confirm_clv: 0.65
+  confirm_bos_len: 3
+  require_sweep: false         # true => a tap must also sweep the 5-bar low (fewer, later signals)
+  sweep_len: 5
+  mintick: 0.05                # NSE/BSE tick (per-suffix override lives in data.tick_sizes)
+  warmup: 60                   # bars ignored at the start of history
+
+# ── Telegram delivery ────────────────────────────────────────────────────────
+telegram:
+  enabled: true
+  bot_token: "${TELEGRAM_BOT_TOKEN}"
+  chat_ids: ["${TELEGRAM_CHAT_ID}"]
+  parse_mode: HTML             # HTML | MarkdownV2 | plain
+  disable_notification: false
+  min_seconds_between_messages: 1.2   # Telegram allows ~1 msg/sec per chat
+  max_retries: 3
+  timeout_sec: 20
+  # api_base: https://api.telegram.org
+  # proxy: http://127.0.0.1:7890
+
+alerts:
+  events: [tap1, approach, confirmed]   # new_ob | approach | tap1 | tap | confirmed | invalidated
+  include_invalidations: false
+  recent_bars: 1               # only events on the newest bar (1 == "this bar just tapped")
+  match_indicator_100: true    # live mode also replays the last CLOSED bar, so nothing the
+                               # indicator printed can be missed by a delayed feed
+  skip_stale_bars: true        # never alert when the last bar is not today's session
+  once_per_symbol_per_day: true
+  min_liquidity_dollar_volume: 5000000000   # ~₹5000 crore / 20d median turnover
+  min_price: 20
+  max_price: 0
+  max_age_bars: 0
+  daily_limit: 0
+  quiet_log_only: false
+  chart: true
+  chart_bars: 140
+  top_zones: 40
+  default_exchange: NSE
+  link_template: "https://in.tradingview.com/chart/?symbol={exchange}:{symbol}"
+
+live:
+  market_timezone: Asia/Kolkata
+  trading_days: [mon, tue, wed, thu, fri]
+  session_open: "09:15"
+  session_close: "15:30"
+  intraday_poll_minutes: 10
+  scan_times: ["09:35", "11:30", "13:30", "15:35", "16:10"]
+  run_on_startup: true
+  heartbeat_daily_time: "15:45"
+  log_file: logs/precision_tap.log
+  max_workers: 6
+
+backtest:
+  entry_trigger: tap1          # tap1 | tap | confirmed | tap1_or_confirmed
+  min_tap: 1
+  max_tap: 1
+  same_bar_stop: true          # assume the worst intrabar path on the entry bar
+  stop_mode: touch             # touch (low <= stop) | close (mirrors the indicator's invalidation)
+  target_r: 2.0                # 0 disables the take-profit
+  trail_mode: none             # none | breakeven | chandelier | structure
+  chandelier_atr: 3.0
+  structure_lookback: 5
+  time_stop_bars: 20
+  exit_on_reversal: false
+  commission_bps: 3            # incl. STT/exch. approx. per side — tune to your broker
+  slippage_bps: 5
+  spread_bps: 0
+  risk_per_trade: 1.0
+  max_open_positions: 0
+  initial_capital: 1000000     # ₹10 lakh
+  allow_rollover: false
+  max_entry_distance_atr: 0
+
+state_db: data/state.sqlite3
+out_dir: results
+log_level: INFO

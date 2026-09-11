@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "precision-tap"
+version = "1.0.0"
+description = "NSE/BSE daily scanner + backtest engine for the 'Institutional OB — Precision Tap & Pre-Order' Pine indicator, with Telegram alerts"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["pandas>=2.0", "numpy>=1.24", "requests>=2.31", "PyYAML>=6.0", "yfinance>=0.2.40"]
+
+[project.optional-dependencies]
+charts = ["matplotlib>=3.7"]
+dev = ["pytest>=7.4", "lxml>=4.9"]
+
+[project.scripts]
+precision-tap = "precision_tap.cli:main"
+
+[tool.setuptools]
+packages = ["precision_tap"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

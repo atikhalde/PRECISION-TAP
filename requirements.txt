@@ -1,0 +1,12 @@
+# core
+pandas>=2.0
+numpy>=1.24
+requests>=2.31
+PyYAML>=6.0
+yfinance>=0.2.40
+# optional: charts attached to Telegram alerts + equity curve in reports
+matplotlib>=3.7
+# optional: pandas.read_html for nifty50/100 universe scraping
+lxml>=4.9
+# dev
+pytest>=7.4

@@ -1,0 +1,24 @@
+services:
+  precision-tap:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: precision-tap:latest
+    container_name: precision-tap
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Kolkata
+      TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+      TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
+      # PRECISION_TAP_SYMBOLS: "RELIANCE,TCS,INFY"
+      # PRECISION_TAP_PROVIDER: yfinance
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+      - ./data:/app/data          # cache + SQLite ledger survive restarts
+      - ./results:/app/results
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,sys;sys.exit(0 if os.path.exists('/app/data') else 1)"]
+      interval: 5m
+      timeout: 10s
+      retries: 3

@@ -1,0 +1,17 @@
+# Cron alternative to the systemd `run` loop — one scan per invocation (--once).
+# NSE session is 09:15–15:30 IST. Times below are IST; make sure the host clock is
+# Asia/Kolkata (or set TZ=) or convert to your server's timezone.
+#
+#   crontab -e   →   TZ=Asia/Kolkata
+TZ=Asia/Kolkata
+PATH=/opt/precision-tap/.venv/bin:/usr/local/bin:/usr/bin:/bin
+MAILTO=""
+
+# intraday touch checks every 15 min during the session
+*/15 9-15 * * 1-5  cd /opt/precision-tap && python -m precision_tap scan --live >> logs/cron.log 2>&1
+# the close print + settled EOD bar (authoritative, closed-bar = indicator-exact)
+35 15 * * 1-5      cd /opt/precision-tap && python -m precision_tap scan >> logs/cron.log 2>&1
+10 16 * * 1-5      cd /opt/precision-tap && python -m precision_tap scan >> logs/cron.log 2>&1
+# weekly housekeeping + a fresh data cache for weekend backtesting
+45 18 * * 0        cd /opt/precision-tap && python -m precision_tap export-data --days 2000 >> logs/cron.log 2>&1
+55 18 * * 0        cd /opt/precision-tap && sqlite3 data/state.sqlite3 "DELETE FROM alerts WHERE created_at < datetime('now','-120 day');" >> logs/cron.log 2>&1
