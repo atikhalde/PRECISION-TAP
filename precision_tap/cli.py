@@ -180,6 +180,8 @@ def cmd_doctor(args) -> int:
     print(tg_line)
     if cfg.telegram.enabled and not (tok and cfg.telegram.chat_ids):
         print("                  → set TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env")
+        print("                  → until then every alert is logged, never delivered")
+        ok = False
     try:
         with StateStore(cfg.state_db) as st:
             st.start_run("doctor", 0) and None
@@ -293,17 +295,24 @@ def cmd_scan(args) -> int:
 def cmd_run(args) -> int:
     cfg = _cfg(args)
     setup_logging(cfg.log_level, cfg.live.log_file if not args.no_logfile else None)
+    # Same contract as `scan`: with no working transport, log the alerts instead
+    # of parking them in a retry queue that can never drain.
+    dry = bool(args.no_send) or not (cfg.telegram.enabled and cfg.telegram.bot_token
+                                     and cfg.telegram.chat_ids)
     with _store(cfg) as store:
-        sc = _scanner(cfg, dry_run=bool(args.no_send), store=store)
+        sc = _scanner(cfg, dry_run=dry, store=store)
         from .live import LiveLoop
         loop = LiveLoop(cfg, sc, store=store, heartbeat=not args.no_heartbeat,
                         max_cycles=args.max_cycles,
                         stop_after=(time.monotonic() + args.duration) if args.duration else None)
-        if args.once:
-            loop._scan("once")
-            print("single cycle finished")
-            return 0
-        return loop.run()
+        try:
+            if args.once:
+                loop._scan("once")
+                print("single cycle finished")
+                return 0
+            return loop.run()
+        finally:
+            sc.close()
 
 
 def cmd_backtest(args) -> int:
@@ -446,10 +455,14 @@ def cmd_alerts(args) -> int:
         if not rows:
             print("no alerts recorded yet")
             return 0
-        print(f"{'created':<20}{'symbol':<16}{'event':<12}{'level':>10}{'price':>10}  sent")
+        def _state(row) -> str:
+            # sent: 1 delivered · 0 queued for retry · 2 given up (log-only / no transport)
+            return {1: "sent", 0: "queued", 2: "log-only"}.get(int(row["sent"] or 0), "?")
+
+        print(f"{'created':<20}{'symbol':<16}{'event':<12}{'level':>10}{'price':>10}  state")
         for r in rows:
             print(f"{str(r['created_at'])[:19]:<20}{r['symbol']:<16}{r['event']:<12}"
-                  f"{_fmt(r['level']):>10}{_fmt(r['price']):>10}  {r['sent']}")
+                  f"{_fmt(r['level']):>10}{_fmt(r['price']):>10}  {_state(r)}")
         pend = store.pending(limit=50)
         if pend:
             print(f"\n{len(pend)} queued for retry")

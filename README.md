@@ -156,6 +156,18 @@ closing print and the settled EOD bar). It survives restarts (the SQLite ledger 
 already sent), retries queued alerts, and sends a 15:45 heartbeat so silence is never ambiguous.
 Logs go to `logs/precision_tap.log`, plus `results/scan_<mode>_<stamp>.md` per cycle.
 
+**Scan mode follows the market, not the trigger.** Any cycle that lands inside 09:15–15:30 runs in
+*live* mode: it rebuilds today's forming bar from `data.intraday_interval` ticks, so an intrabar tap
+is caught the way TradingView's "Once Per Bar" alert is. Everything after the close runs in *eod*
+mode on settled bars. Both modes also replay the frame with the last bar closed
+(`alerts.match_indicator_100`), which is the only way a `confirmed` (OB defence) alert can be
+produced — the indicator only confirms on a closed bar.
+
+Live and closed-bar frames are cached under **separate keys**, and a cached frame is only reused if
+its newest bar is the session the feed should already have — so a mid-session poll can never be
+served last night's EOD frame. Keep `data.eod_cache_max_age_minutes` shorter than the gap between
+your last two post-close `scan_times`, or the "settled bar" scan just re-reads the pre-close fetch.
+
 **systemd** (`deploy/systemd/precision-tap.service`), **Docker/compose** (`deploy/`) and a
 **cron** variant (`--once`) are included — see `deploy/README.md`.
 
@@ -193,7 +205,8 @@ precision_tap/
   live.py       ← session-aware scheduler (polling, scan times, heartbeat, signals)
   state.py      ← SQLite: alert ledger, dedupe, retry queue, zone memory, run log
   cli.py        ← the commands above
-tests/          ← pytest: parity wrappers, yfinance adapter (fake), Telegram (local mock), scanner/backtest
+tests/          ← pytest: parity wrappers, yfinance adapter (fake), Telegram (local mock),
+                  scanner/backtest, and the **live path** (feed freshness, scheduler, delivery)
 universe/nse.txt, config.example.yaml, tools/mock_telegram_server.py, deploy/
 ```
 
@@ -203,6 +216,9 @@ universe/nse.txt, config.example.yaml, tools/mock_telegram_server.py, deploy/
 |---|---|
 | `Telegram not configured` | `.env` needs `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; check `python -m precision_tap telegram-test` |
 | No alerts at all, ever | the gates are strict by design: try `--set indicator.min_rvol=1.4 --set indicator.min_clv=0.65`, and check `alerts.min_liquidity_dollar_volume`/`min_price`; `verify SYM` shows what the engine sees |
+| `scan --no-send` shows alerts but `run` sends nothing | `.env` is missing/unreadable, so `run` falls back to log-only. It says so once at startup and on every cycle; `doctor` prints the token/chat status |
+| Cycle runs every 10 min but the notes say `skipped` | the feed's newest bar is not a recent session (`skip_stale_bars`). Check `data.provider`, the yfinance version, and `doctor --net` |
+| Alerts repeat yesterday's session | the intraday rebuild failed, so today's bar is missing; the stale guard then suppresses it. Check `data.live_intraday_bar` / `data.intraday_interval` |
 | Alerts on the wrong day / holidays | keep `alerts.skip_stale_bars: true`; NSE holidays produce no new bar |
 | `no data` / rate limited | raise `data.retry_max`, lower `data.rate_limit_per_sec`, or `export-data` once and run `--provider csv` |
 | One symbol differs from TradingView | compare `data.corporate_adjustments` (adjusted vs raw) and the exact `mintick`; run `verify SYM --end <date>` |
