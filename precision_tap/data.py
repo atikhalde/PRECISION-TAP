@@ -730,9 +730,16 @@ class DataSource:
             self.limiter.wait()
             try:
                 return _history(tk, **dict(kwargs))
-            except TypeError:
-                raise                                   # a signature problem, not transient
             except Exception as exc:
+                # Only "this yfinance build does not accept that kwarg" is a
+                # signature problem — and `_history` already heals those.  Every
+                # other TypeError is transient: yfinance raises
+                # ``argument of type 'NoneType' is not iterable`` from
+                # ``_get_ticker_tz`` whenever the metadata request comes back
+                # empty, which used to abort every symbol of the cycle with no
+                # retry at all.
+                if isinstance(exc, TypeError) and _UNEXPECTED_KWARG.search(str(exc)):
+                    raise
                 last = exc
                 if attempt >= max(1, self.cfg.retry_max):
                     break

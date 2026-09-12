@@ -7,6 +7,13 @@ TZ=Asia/Kolkata
 PATH=/opt/precision-tap/.venv/bin:/usr/local/bin:/usr/bin:/bin
 MAILTO=""
 
+# Secrets.  A cron job starts with an almost empty environment, so without this
+# `config.yaml`'s ${TELEGRAM_BOT_TOKEN} expands to nothing: every alert is found,
+# rendered, logged as "log-only" and dropped (and `scan` now exits 4 to say so).
+# The scanner reads this file itself — no shell sourcing needed; point it
+# somewhere else with the same variable if you keep secrets elsewhere.
+PRECISION_TAP_ENV_FILE=/etc/precision-tap.env
+
 # IMPORTANT: plain `scan` (auto mode) everywhere — the mode follows the *market
 # clock*, not the trigger.  Forcing `--live` outside 09:15–15:30 makes every
 # symbol skip with "live bar unavailable" (there is no forming bar to read),

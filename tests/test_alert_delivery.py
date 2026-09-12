@@ -323,3 +323,183 @@ def test_livecheck_fails_loudly_without_credentials(monkeypatch, tmp_path, capsy
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
     assert cmd_livecheck(A()) == 1
     assert "RESULT: FAIL" in capsys.readouterr().out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# a cycle that found alerts with nothing to send them with must not be green
+# ─────────────────────────────────────────────────────────────────────────────
+def _scan_args(tmp_path, extra=(), **over):
+    """The argparse namespace `cmd_scan` reads, wired to an offline config."""
+
+    class A:
+        config = None
+        set = [f"--SET"]
+        env_file = None
+        symbols = None
+        days = None
+        provider = None
+        limit = None
+        events = None
+        recent_bars = None
+        no_charts = True
+        min_dollar_volume = None
+        trigger = target_r = stop_mode = trail = time_stop = risk = capital = max_positions = None
+        live = False
+        eod = True
+        end = None
+        no_send = False
+        report_only = False
+        retried = False
+        messages = False
+        top = 5
+        workers = 1
+
+    a = A()
+    a.set = ["data.provider=yfinance", "data.universe=RELIANCE.NS,TCS.NS,INFY.NS",
+             "data.min_bars=90", f"data.cache_dir={tmp_path / 'cache'}",
+             f"out_dir={tmp_path / 'out'}", "state_db=:memory:", "alerts.chart=false",
+             # the synthetic feed has toy prices/volumes, so the production floors
+             # would filter it — that is not what these tests are about
+             "alerts.min_liquidity_dollar_volume=0", "alerts.min_price=0",
+             "telegram.enabled=false", *extra]
+    for k, v in over.items():
+        setattr(a, k, v)
+    return a
+
+
+def test_scan_without_a_transport_exits_nonzero(tmp_path, monkeypatch, capsys):
+    """The classic silent deployment: cron/systemd without the secrets in its env.
+
+    Every alert is found, rendered and logged as log-only, exit 0 — so the cron
+    log looks fine and the chat stays empty forever.  ``--no-send`` is an explicit
+    dry run and must stay green; this is not.
+    """
+    from precision_tap.cli import cmd_scan
+
+    patch_source(monkeypatch)
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    rc = cmd_scan(_scan_args(tmp_path))
+    err = capsys.readouterr().err
+    assert rc == 4, (rc, err)
+    assert "nothing could send them" in err, err
+    assert "telegram.enabled" in err or "TELEGRAM_BOT_TOKEN" in err, err
+
+
+def test_explicit_dry_runs_stay_green(tmp_path, monkeypatch, capsys):
+    """`--no-send` and `--report-only` ask for silence, so silence is not a failure."""
+    from precision_tap.cli import cmd_scan
+
+    patch_source(monkeypatch)
+    assert cmd_scan(_scan_args(tmp_path, no_send=True)) == 0
+    assert cmd_scan(_scan_args(tmp_path, report_only=True)) == 0
+    capsys.readouterr()
+
+
+def test_no_transport_note_names_the_reason(monkeypatch):
+    """"NOT SENT" has to say *why*, or the user is still guessing."""
+    patch_source(monkeypatch)
+    with StateStore(":memory:") as store:
+        rep = Scanner(scan_cfg(), store=store, dry_run=True).scan(live=True, progress=False)
+    assert rep.alerts, rep.summary_line
+    note = [n for n in rep.notes if n.startswith("NOT SENT")]
+    assert note, rep.notes
+    assert "telegram.enabled is false" in note[0], note[0]
+
+    tg_off = scan_cfg(telegram=TelegramConfig(enabled=True, bot_token="", chat_ids=[]))
+    with StateStore(":memory:") as store:
+        rep2 = Scanner(tg_off, store=store, dry_run=True).scan(live=True, progress=False)
+    note2 = [n for n in rep2.notes if n.startswith("NOT SENT")]
+    assert note2 and "TELEGRAM_BOT_TOKEN" in note2[0], rep2.notes
+
+
+def test_a_queued_row_is_released_when_no_transport_can_drain_it():
+    """A retry that can never run must not hold the day's de-duplication key.
+
+    ``record_alert`` parks an alert as QUEUED (a delivery is owed) until it is
+    marked delivered.  Without a transport the retry pass used to return early and
+    leave the row there — and a queued row counts as "already alerted", so the
+    same signal was lost for the rest of the day even after the bot came back.
+    """
+    from precision_tap.alerts import AlertDispatcher
+    from precision_tap.params import AlertConfig, Params
+
+    with StateStore(":memory:") as store:
+        assert store.record_alert("K1", symbol="RELIANCE.NS", event="tap1") is True
+        assert store.seen("K1") is True, "a delivery is owed on a fresh row"
+        dead = AlertDispatcher(AlertConfig(), None, store, Params(), dry_run=True)
+        assert dead.retry_pending() == 0
+        assert store.seen("K1") is False, "no transport → free the key, do not hold it"
+
+
+def test_a_queued_row_is_retried_when_the_transport_works(ok_telegram):
+    from precision_tap.alerts import AlertDispatcher
+    from precision_tap.params import AlertConfig, Params
+
+    api, sent = ok_telegram
+    with StateStore(":memory:") as store:
+        store.record_alert("K1", symbol="RELIANCE.NS", event="tap1", message="🎯 tap")
+        live = AlertDispatcher(AlertConfig(), TelegramClient(_tg(api)), store, Params())
+        assert live.retry_pending() == 1
+        assert store.seen("K1") is True, "it is delivered now, so it must count as seen"
+        assert sent and "tap" in sent[0]
+
+
+def test_env_file_is_read_from_the_documented_paths(tmp_path, monkeypatch):
+    """`/etc/precision-tap.env` is where the deploy docs put the secrets.
+
+    A cron entry has no shell environment, so a config whose token is
+    ``${TELEGRAM_BOT_TOKEN}`` expanded to nothing, every alert was logged instead
+    of sent, and the run stayed green.  Both ``PRECISION_TAP_ENV_FILE`` and the
+    documented path now close that hole.
+    """
+    from precision_tap import config as C
+
+    env = tmp_path / "precision-tap.env"
+    env.write_text("TELEGRAM_BOT_TOKEN=42:abc\nTELEGRAM_CHAT_ID=-100999\n", encoding="utf-8")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+    monkeypatch.setenv("PRECISION_TAP_ENV_FILE", str(env))
+    cfg = C.load_config(None, env_path=None)
+    assert cfg.telegram.bot_token == "42:abc" and cfg.telegram.chat_ids == ["-100999"], \
+        "the override must feed ${TELEGRAM_BOT_TOKEN} expansion"
+
+    monkeypatch.delenv("PRECISION_TAP_ENV_FILE")
+    monkeypatch.setattr(C, "ENV_FILE_CANDIDATES", (tmp_path / "absent.env", env))
+    cfg2 = C.load_config(None, env_path=None)
+    assert cfg2.telegram.bot_token == "42:abc", "the candidate list must be walked in order"
+    assert "/etc/precision-tap.env" in (".env", "config/.env", "/etc/precision-tap.env")
+
+
+def test_missing_env_file_is_reported(tmp_path, monkeypatch, caplog):
+    """A typo in the env path must be visible, not a silent drop to log-only."""
+    import logging
+
+    from precision_tap import config as C
+
+    monkeypatch.setenv("PRECISION_TAP_ENV_FILE", str(tmp_path / "nope.env"))
+    with caplog.at_level(logging.WARNING, logger="precision_tap.config"):
+        C.load_dotenv()
+    assert any("nope.env" in r.getMessage() for r in caplog.records), caplog.text
+
+
+def test_env_file_does_not_clobber_the_real_environment(tmp_path, monkeypatch):
+    """The new env-file lookup must keep ``load_dotenv``'s non-clobbering rule.
+
+    Secrets in the process environment win over the file unless ``override`` is
+    asked for — and reading ``PRECISION_TAP_ENV_FILE`` inside the loader is one
+    shadowed name away from silently reversing that.
+    """
+    import os
+
+    from precision_tap import config as C
+
+    env = tmp_path / "precision-tap.env"
+    env.write_text("TELEGRAM_BOT_TOKEN=from-file\n", encoding="utf-8")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "from-shell")
+    monkeypatch.setenv("PRECISION_TAP_ENV_FILE", str(env))
+    assert C.load_dotenv() == []
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "from-shell"
+    assert C.load_dotenv(override=True) == ["TELEGRAM_BOT_TOKEN"]
+    assert os.environ["TELEGRAM_BOT_TOKEN"] == "from-file"

@@ -251,6 +251,7 @@ class DispatchResult:
     sent: int = 0
     queued: int = 0
     skipped: int = 0
+    log_only: int = 0      # subset of ``skipped``: found, rendered, nothing to send with
     failed: int = 0
     messages: List[str] = None  # type: ignore[assignment]
     errors: List[str] = None    # type: ignore[assignment]
@@ -263,6 +264,10 @@ class DispatchResult:
 
     def __str__(self) -> str:
         out = (f"sent={self.sent} queued={self.queued} skipped={self.skipped} failed={self.failed}")
+        if self.log_only:
+            # the difference between "already alerted" and "no transport" is the
+            # whole story of a silent chat, so it must be readable at a glance
+            out += f" log-only={self.log_only}"
         if self.errors:
             out += " | " + " · ".join(dict.fromkeys(self.errors))
         return out
@@ -323,14 +328,14 @@ class AlertDispatcher:
             if not is_new:
                 res.skipped += 1
                 continue
-            photo = None
-            if self.cfg.chart and self.render_charts is not None:
-                try:
-                    photo = self.render_charts(ev, ctx)
-                except Exception as exc:                # a bad chart must never eat a signal
-                    log.debug("chart render failed for %s: %s", ev.symbol, exc)
             if not self.deliverable:
+                # Rendered text, no picture: drawing a chart nobody will receive
+                # costs a matplotlib pass *and* an extra provider fetch per alert
+                # (`_render_chart` re-reads the frame when the cycle did not keep
+                # it), which in a dry cycle over the full market is minutes of
+                # work and hundreds of files for nothing.
                 res.skipped += 1
+                res.log_only += 1        # not a de-duplication: nothing could be sent
                 log.info("alert (log-only) %s %s\n%s", ev.symbol, name, text)
                 res.messages.append({"symbol": ev.symbol, "kind": name, "text": text,
                                      "ok": False, "why": "no telegram transport"})
@@ -339,6 +344,12 @@ class AlertDispatcher:
                     # in the retry queue, there is nothing to retry it with
                     self.store.give_up([key])
                 continue
+            photo = None
+            if self.cfg.chart and self.render_charts is not None:
+                try:
+                    photo = self.render_charts(ev, ctx)
+                except Exception as exc:                # a bad chart must never eat a signal
+                    log.debug("chart render failed for %s: %s", ev.symbol, exc)
             markup = build_buttons(ev, ctx, self.cfg)
             results = []
             try:
@@ -381,6 +392,17 @@ class AlertDispatcher:
         if self.store is None or self.cfg.quiet_log_only:
             return 0
         if not self.deliverable:
+            # A row left at QUEUED by a cycle that died before it could mark the
+            # result counts as "already alerted" for the rest of the day — and
+            # with no transport this pass can never clear it.  Hand those keys
+            # back (``GIVEN_UP`` is not "seen") so the first cycle with a working
+            # bot still gets them, and say how many were parked.
+            stuck = self.store.pending(limit=200)
+            if stuck:
+                self.store.give_up([r.key for r in stuck])
+                log.warning("%d queued alert(s) released without a Telegram transport — "
+                            "set TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID to actually send them",
+                            len(stuck))
             return 0
         sent = 0
         for row in self.store.pending(limit=limit):

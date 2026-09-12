@@ -22,7 +22,6 @@ import pandas as pd
 import pytest
 
 from precision_tap.data import DataSource, merge_today_bar, synthetic_frame
-from precision_tap.data import _now_tz
 from precision_tap.params import DataConfig
 
 TZ = "Asia/Kolkata"
@@ -133,7 +132,8 @@ def test_session_date_comes_from_the_exchange_clock_not_the_stamp():
 def test_merge_returns_none_when_the_prints_are_not_todays_session():
     """A stale intraday feed must not clobber a settled bar with a partial one."""
     daily = _market().iloc[:-1]
-    today = _now_tz(TZ).date()
+    today = _last_session().date()      # the session the fixtures are stamped into —
+                                        # _now_tz() would roll past it after midnight IST
     stale = _prints(_market()).iloc[:2]
     stale.index = stale.index - pd.Timedelta(days=3)
     # with an expectation: refuse, so a settled bar is never clobbered
@@ -148,8 +148,13 @@ def test_merge_returns_none_when_the_prints_are_not_todays_session():
 # ─────────────────────────────────────────────────────────────────────────────
 # the yahoo provider, live
 # ─────────────────────────────────────────────────────────────────────────────
-def test_yahoo_live_fetch_rebuilds_todays_bar(tmp_path, monkeypatch):
-    """End to end through ``_yahoo``: tz-aware payload → live Bars, no crash."""
+def test_yahoo_live_fetch_rebuilds_todays_bar(tmp_path, monkeypatch, exchange_clock):
+    """End to end through ``_yahoo``: tz-aware payload → live Bars, no crash.
+
+    ``exchange_clock`` pins "today" onto the fixture's session: mid-session is
+    exactly when the intraday rebuild is supposed to engage, and an unpinned
+    clock only agrees with the synthetic market on weekday IST afternoons.
+    """
     df = _market()
 
     def fake_json(self, url, params):
@@ -192,7 +197,7 @@ def test_yahoo_honours_corporate_adjustments(tmp_path, monkeypatch):
 # ─────────────────────────────────────────────────────────────────────────────
 # the yfinance provider, live
 # ─────────────────────────────────────────────────────────────────────────────
-def test_yfinance_survives_a_build_that_dropped_progress_and_threads(tmp_path):
+def test_yfinance_survives_a_build_that_dropped_progress_and_threads(tmp_path, exchange_clock):
     """yfinance >= 1.0: ``PriceHistory.history`` rejects both kwargs.
 
     ``Ticker.history`` still forwards ``**kwargs``, so the TypeError surfaces

@@ -39,6 +39,8 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import precision_tap.data as pt_data                      # noqa: E402
+import precision_tap.scanner as pt_scanner                 # noqa: E402
 from precision_tap.config import load_config               # noqa: E402
 from precision_tap.data import DataSource, synthetic_frame  # noqa: E402
 from precision_tap.live import LiveLoop                    # noqa: E402
@@ -212,9 +214,21 @@ class FakeYFinance:
 
 @contextlib.contextmanager
 def patched(market: Optional[FakeYahoo], provider: str):
-    """Point the providers at the fake market, and put everything back after."""
+    """Point the providers at the fake market, and put everything back after.
+
+    The market is fake but the calendar is not, so the exchange clock gets
+    pinned here too: ``data._now_tz`` / ``scanner._session_now`` still ask the
+    host clock whether a bar is from *today*, and on a weekend (or the hours
+    after midnight IST) the host date has moved past ``last_session()`` — the
+    live bar then looks stale and a correct scanner refuses to alert on it,
+    which used to make this drill fail purely because of when CI ran.
+    """
     saved_json = DataSource._http_json
     saved_yf = sys.modules.get("yfinance")
+    now = (last_session() + pd.Timedelta(hours=11, minutes=30)).tz_localize(TZ).to_pydatetime()
+    saved_now = (pt_data._now_tz, pt_scanner._session_now)
+    pt_data._now_tz = lambda _tzname=TZ: now
+    pt_scanner._session_now = lambda _tzname=TZ: now
     try:
         if market is not None:
             DataSource._http_json = lambda self, url, params: market.json(url, params)  # type: ignore[method-assign]
@@ -223,6 +237,7 @@ def patched(market: Optional[FakeYahoo], provider: str):
         yield
     finally:
         DataSource._http_json = saved_json                       # type: ignore[method-assign]
+        pt_data._now_tz, pt_scanner._session_now = saved_now
         if saved_yf is not None:
             sys.modules["yfinance"] = saved_yf
         else:

@@ -53,7 +53,15 @@ def render_chart(df: pd.DataFrame, zones, event=None, *, out_path: str | Path,
         log.info("matplotlib unavailable (%s) — skipping chart", exc)
         return None
 
-    df = df.tail(max(30, int(bars)))
+    # The overlay is drawn on a truncated window, so every bar index has to be
+    # rebased on the first bar that is actually plotted.  Measuring the offset
+    # *after* the truncation (``len(df) - n``) always yields 0, which puts a zone
+    # born at bar 596 at x=596 of a 120-bar window: negative width, nothing
+    # visible, and the tap marker silently skipped — every alert then ships a
+    # chart of bare candles while still looking like a success.
+    window = max(30, int(bars))
+    start_bar = max(0, len(df) - window)
+    df = df.iloc[start_bar:]
     n = len(df)
     x = np.arange(n)
     o = df["open"].to_numpy(float)
@@ -75,7 +83,6 @@ def render_chart(df: pd.DataFrame, zones, event=None, *, out_path: str | Path,
     _candles(ax, x, o, h, l, c)
     axv.bar(x, v, width=0.62, color=np.where(c >= o, C_UP, C_DOWN), alpha=0.75)
 
-    start_bar = len(df) - n
     live = [z for z in (zones or []) if getattr(z, "state", -1) >= 0]
     tapped = getattr(event, "zid", None)
     for z in live[-12:]:
@@ -87,8 +94,6 @@ def render_chart(df: pd.DataFrame, zones, event=None, *, out_path: str | Path,
         ax.add_patch(Rectangle((max(left, -0.5), z.bot), (n - 0.5) - max(left, -0.5),
                                max(z.top - z.bot, 1e-9), facecolor=color, alpha=0.17,
                                edgecolor=color, linewidth=1.0, zorder=1))
-        if max(left, -0.5) < 0 and z.top > z.bot:
-            ax.add_patch(Rectangle((max(left, -0.5), z.bot), 0.0, 0.0, alpha=0.0))
         ax.axhline(z.entry, color=color, linewidth=1.1, linestyle="-", alpha=0.9)
         ax.axhline(z.stop, color=C_STOP, linewidth=0.8, linestyle="--", alpha=0.7)
 
