@@ -308,6 +308,16 @@ def cmd_scan(args) -> int:
                       workers=args.workers)
         print(f"\n{BANNER}")
         print(f"mode={rep.mode} started={rep.started_at}  {rep.summary_line}")
+        # The one fact that decides whether a silent cycle is expected: which
+        # session it looked at.  With `alerts.recent_bars: 1` a weekend or
+        # pre-settle run re-reads the *previous* bar, and saying so up front is
+        # the difference between "quiet market" and "why did I run this twice?".
+        # Only for a feed that follows the exchange clock — a csv/synthetic
+        # replay is frozen by definition, so "today" means nothing to it.
+        if rep.market_state and rep.bar_session and rep.bar_session != rep.session_now:
+            print(f"session: evaluated {rep.bar_session} · today is {rep.session_now} "
+                  f"({rep.market_state or 'n/a'})"
+                  + ("" if rep.trading_day else " · not a trading day"))
         print()
         print(rep.console_table(args.top))
         print(f"\nalerts matched: {len(rep.alerts)}")
@@ -770,13 +780,18 @@ def cmd_livecheck(args) -> int:
                 failures.append(f"{rep.dispatch.undelivered} alert(s) found but not delivered — "
                                 f"see the errors above")
         for note in rep.notes:
-            if note.startswith(("DELIVERY PROBLEM", "NOT SENT", "nothing to send", "also filtered")):
+            if note.startswith(("DELIVERY PROBLEM", "NOT SENT", "nothing to send", "also filtered",
+                                "MARKET CLOSED", "FEED BEHIND", "no usable symbols")):
                 print(f"  note: {note}")
         if rep.alerts and tg_ok:
             print(f"  ✅ {len(rep.alerts)} alert(s) delivered — check the chat")
         elif not rep.alerts and not failures:
-            print("  ℹ no signal in this window — that is a quiet market, not a broken scanner. "
-                  "Widen it with --recent-bars 3 --events tap1,tap,approach,confirmed")
+            # Name the bar: "no signal in this window" is unanswerable when the
+            # window is a weekend's re-read of Friday and the user does not know
+            # that is what they just asked for.
+            which = f" (the bar evaluated was {rep.bar_session})" if rep.bar_session else ""
+            print(f"  ℹ no signal in this window{which} — that is a quiet market, not a broken "
+                  "scanner. Widen it with --recent-bars 3 --events tap1,tap,approach,confirmed")
         sc.close()
 
     print("\n" + ("=" * 62))

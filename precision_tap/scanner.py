@@ -32,7 +32,8 @@ import pandas as pd
 from .alerts import (AlertDispatcher, build_buttons, dedupe_key, event_name, event_rank,
                      passes_filters, render_message)
 from .chart import render_chart
-from .data import LIVE_PROVIDERS, Bars, DataSource, read_universe, session_date
+from .data import (LIVE_PROVIDERS, Bars, DataSource, _expected_last_bar_date, read_universe,
+                   session_date)
 from .engine import EV_APPROACH, EV_CONFIRMED, EV_INVALID, EV_NEW, EV_TAP, EngineResult, Event, Zone, run_engine
 from .params import AlertConfig, DataConfig, Params, ScanConfig, TelegramConfig
 
@@ -124,6 +125,18 @@ class ScanReport:
     rows: List[SymbolScan] = field(default_factory=list)
     dispatch: Any = None
     notes: List[str] = field(default_factory=list)
+    #: Exchange-local date this cycle ran on, and the newest session the feed
+    #: actually returned.  ``alerts.recent_bars: 1`` means a cycle evaluates
+    #: exactly one bar, so *which* bar that was is the single most important
+    #: fact about a silent cycle: two runs on a weekend both re-read Friday and
+    #: are not two chances at anything.  ``expected_session`` is what the feed
+    #: should already have been able to return, which is what separates "the
+    #: market is shut" (expected silence) from "the feed is behind" (a fault).
+    session_now: str = ""
+    bar_session: str = ""
+    expected_session: str = ""
+    market_state: str = ""               # open | closed | "" when not exchange-tracked
+    trading_day: bool = True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -132,6 +145,9 @@ class ScanReport:
             "symbols_with_zones": self.symbols_with_zones, "events_total": self.events_total,
             "events_in_window": self.events_in_window, "filtered": self.filtered,
             "skipped_symbols": self.skipped_symbols,
+            "session_now": self.session_now, "bar_session": self.bar_session,
+            "expected_session": self.expected_session, "market_state": self.market_state,
+            "trading_day": self.trading_day,
             "delivery": str(self.dispatch) if self.dispatch is not None else "",
             "alerts": [
                 {"symbol": s.symbol, "event": event_name(e), "tap_no": e.tap_no,
@@ -165,8 +181,11 @@ class ScanReport:
         for _, e in self.alerts:
             kinds[event_name(e)] = kinds.get(event_name(e), 0) + 1
         acc = " ".join(f"{k}={v}" for k, v in sorted(kinds.items())) or "no alerts"
+        # `bar=` is the session the cycle actually evaluated.  Without it a
+        # weekend cycle and a quiet trading day print the same line.
+        bar = f" bar={self.bar_session}" if self.bar_session else ""
         return (f"universe={self.universe} usable={self.usable} errors={self.errors} "
-                f"zones={self.symbols_with_zones} | {acc}")
+                f"zones={self.symbols_with_zones}{bar} | {acc}")
 
 
 class Scanner:
@@ -328,6 +347,7 @@ class Scanner:
         rep.alerts = [(st, ev) for st, ev, _ in items]
         tally = " · ".join(f"{why} {n}" for why, n in
                            sorted(dropped.items(), key=lambda kv: (-kv[1], kv[0])))
+        self._describe_session(rep, requested_live=requested_live)
         if rep.usable == 0 and rep.universe > 0:
             # A whole cycle with nothing usable is never "a quiet market" — say
             # which of the two possible causes it is, so the log (and the GitHub
@@ -354,10 +374,17 @@ class Scanner:
             # cycle, and silence is indistinguishable from a broken pipeline
             # unless the cycle says which it was.
             if rep.events_in_window == 0 and not tally:
+                window = f"the last {max(1, int(cfg.alert.recent_bars))} bar(s)"
+                if rep.bar_session:
+                    window += f", newest {rep.bar_session}"
+                # "a quiet session" is a lie on a day there was no session at
+                # all — the market-state note above already said which it was.
+                tail = ("gates not met" if rep.market_state == "closed"
+                        else "gates not met or a quiet session")
                 rep.notes.append(
-                    f"nothing to send — no indicator signal in the last "
-                    f"{max(1, int(cfg.alert.recent_bars))} bar(s) of {rep.usable} usable symbol(s) "
-                    f"({rep.symbols_with_zones} with a live zone); gates not met or a quiet session")
+                    f"nothing to send — no indicator signal in {window} of "
+                    f"{rep.usable} usable symbol(s) "
+                    f"({rep.symbols_with_zones} with a live zone); {tail}")
             else:
                 rep.notes.append("nothing to send — " + (tally or "no events in the alert window"))
         elif tally:
@@ -402,6 +429,63 @@ class Scanner:
                                   note=rep.summary_line)
         self._write_report(rep)
         return rep
+
+    # ── which session did this cycle actually evaluate? ───────────────────
+    def _describe_session(self, rep: ScanReport, *, requested_live: bool) -> None:
+        """Name the bar the cycle looked at, and say so when it is not today's.
+
+        ``alerts.recent_bars: 1`` means one cycle evaluates exactly **one** bar.
+        A green run with an empty chat is therefore only interpretable if it
+        names that bar: on a weekend, a holiday or a pre-settle scan the newest
+        bar is the *previous* session, which an earlier cycle has already
+        evaluated — so a re-run finds nothing and that is correct, not a fault.
+        Without this the two runs a user triggers on a Saturday both look like
+        independent attempts that the scanner silently failed.
+        """
+        cfg = self.cfg
+        tz = cfg.live.market_timezone
+        now = _session_now(tz)
+        rep.session_now = now.date().isoformat()
+        rep.trading_day, why_closed = _is_trading_day(now, cfg.live.trading_days)
+        tracks = self._tracks_live_market()
+        if tracks:
+            rep.market_state = ("open" if _market_open(tz, now, (cfg.live.session_open,
+                                                                 cfg.live.session_close))
+                                else "closed")
+        sessions = sorted({r.last_date for r in rep.rows if r.ok and r.last_date})
+        rep.bar_session = sessions[-1] if sessions else ""
+        # A frozen replay (csv / synthetic / a historical `--end`) has no
+        # "today" to be behind: the exchange clock says nothing about it.
+        if not rep.bar_session or not tracks:
+            return
+        rep.expected_session = _expected_last_bar_date(tz, live=requested_live).isoformat()
+        back = max(1, int(cfg.alert.recent_bars))
+        if rep.bar_session < rep.expected_session:
+            rep.notes.append(
+                f"FEED BEHIND — the newest bar is {rep.bar_session} but the feed should "
+                f"already have {rep.expected_session}. An NSE holiday explains it (no bar is "
+                f"printed on a holiday); if {rep.expected_session} was a session, the provider "
+                f"has not printed/settled it yet. With alerts.recent_bars={back} this cycle "
+                f"evaluated {rep.bar_session} — a bar an earlier cycle has already seen.")
+        elif rep.bar_session != rep.session_now:
+            if not rep.trading_day:
+                rep.notes.append(
+                    f"MARKET CLOSED — {why_closed}, so there is no session to alert on. "
+                    f"The newest bar is {rep.bar_session} and "
+                    f"alerts.recent_bars={back}, so this cycle evaluated that one bar alone — the "
+                    f"same bar every cycle since the close has already evaluated. Zero alerts here "
+                    f"is the expected result, not a fault: re-running is a re-read of one bar, not "
+                    f"a second chance at the session. To review the week instead, widen the window "
+                    f"(`scan --recent-bars 5`) — the ledger still dedupes what was already sent.")
+            else:
+                why = ("this cycle ran in closed-bar mode while the market is open, so it "
+                       "evaluates the last *completed* session" if rep.market_state == "open"
+                       else "today's EOD bar has not settled yet (it lands after ~16:10 IST)")
+                rep.notes.append(
+                    f"NO FRESH SESSION — {rep.session_now} is a trading day but the newest bar is "
+                    f"{rep.bar_session}: {why}. With alerts.recent_bars={back} this cycle "
+                    f"evaluated {rep.bar_session} alone, so it can only re-report what an earlier "
+                    f"cycle on that bar already reported.")
 
     def _params_for(self, symbol: str) -> Params:
         """Resolve ``syminfo.mintick`` per symbol (NSE/BSE tick = 0.05, US = 0.01)."""
@@ -627,6 +711,21 @@ _MARKET_HOURS = {
     "Europe/London": ((8, 0), (16, 30)),
     "Asia/Tokyo": ((9, 0), (15, 0)),
 }
+
+
+def _is_trading_day(now: datetime, trading_days: Optional[Sequence[str]] = None) -> Tuple[bool, str]:
+    """Is ``now`` on a configured trading day?  Returns ``(ok, reason)``.
+
+    ``live.trading_days`` is the only calendar this scanner has — it knows
+    weekends, not the NSE holiday list.  That is enough to tell a Saturday run
+    "there is no session to alert on" without guessing about a weekday holiday
+    (which shows up as ``FEED BEHIND`` instead, and says so).
+    """
+    allowed = {str(d).strip().lower()[:3] for d in (trading_days or []) if str(d).strip()}
+    day = now.strftime("%a").lower()
+    if allowed and day not in allowed:
+        return False, f"{now:%a %Y-%m-%d} is not a trading day"
+    return True, ""
 
 
 def _market_open(tzname: str = "Asia/Kolkata", now: Optional[datetime] = None,

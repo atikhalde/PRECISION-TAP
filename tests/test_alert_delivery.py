@@ -503,3 +503,252 @@ def test_env_file_does_not_clobber_the_real_environment(tmp_path, monkeypatch):
     assert os.environ["TELEGRAM_BOT_TOKEN"] == "from-shell"
     assert C.load_dotenv(override=True) == ["TELEGRAM_BOT_TOKEN"]
     assert os.environ["TELEGRAM_BOT_TOKEN"] == "from-file"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# a silent cycle must name the session it evaluated
+#
+# Two runs were dispatched on a Saturday, both went green, and the chat stayed
+# empty.  Nothing was broken: `alerts.recent_bars: 1` means a cycle evaluates
+# exactly one bar, and on a non-trading day that bar is the *previous* session —
+# the same bar every cycle since the close has already evaluated.  But the cycle
+# said only "no indicator signal … a quiet session", so the two runs looked like
+# two independent attempts the scanner had silently failed.  These pin the
+# cycle's self-description.
+# ─────────────────────────────────────────────────────────────────────────────
+TZ = "Asia/Kolkata"
+
+
+def _quiet_cycle(monkeypatch, *, now, bar, live=None, **alert_kw):
+    """One cycle with the exchange clock pinned to ``now`` and a feed whose
+    newest bar is ``bar`` — no network, no Telegram, no engineered signal."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import precision_tap.data as D
+    import precision_tap.scanner as SC
+    from precision_tap.data import Bars
+
+    pinned = now if now.tzinfo else datetime(*now.timetuple()[:6], tzinfo=ZoneInfo(TZ))
+
+    def _pinned(tz: str = TZ):
+        return pinned if tz == TZ else pinned.astimezone(ZoneInfo(tz))
+
+    monkeypatch.setattr(D, "_now_tz", _pinned)
+    monkeypatch.setattr(SC, "_session_now", _pinned)
+
+    df = synthetic_frame(n=400, seed=3)                  # nothing engineered at the end
+    df = df.set_axis(df.index + (pd.Timestamp(bar) - df.index[-1]))
+    monkeypatch.setattr(
+        D.DataSource, "get_many",
+        lambda self, symbols, **kw: {
+            s: Bars(symbol=s, df=df, live=False, source="fake",
+                    meta={"currency": "INR", "fullExchangeName": "NSE",
+                          "exchangeTimezoneName": TZ}) for s in symbols})
+    # `scan_cfg` already zeroes the liquidity floor and disables charts
+    cfg = scan_cfg(alert=dict(alert_kw))
+    with StateStore(":memory:") as store:
+        sc = Scanner(cfg, store=store, dry_run=True)
+        rep = sc.scan(live=live, progress=False)
+        sc.close()
+    assert rep.usable > 0, rep.notes                     # the cycle really did evaluate
+    return rep
+
+
+def test_a_weekend_cycle_names_the_bar_it_evaluated(monkeypatch):
+    """Sat 14:18 IST, feed newest = Fri: green, silent, and *expected*."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    rep = _quiet_cycle(monkeypatch, now=datetime(2026, 9, 12, 14, 18, tzinfo=ZoneInfo(TZ)),
+                       bar=pd.Timestamp("2026-09-11"))
+    assert rep.session_now == "2026-09-12"
+    assert rep.bar_session == "2026-09-11"
+    assert rep.expected_session == "2026-09-11"          # the feed is NOT behind
+    assert rep.market_state == "closed" and rep.trading_day is False
+    note = [n for n in rep.notes if n.startswith("MARKET CLOSED")]
+    assert note, rep.notes
+    assert "2026-09-11" in note[0] and "recent_bars" in note[0]
+    assert "--recent-bars" in note[0]                    # …and how to review the week instead
+    # the report the workflow summarises carries it too
+    d = rep.to_dict()
+    assert d["bar_session"] == "2026-09-11" and d["market_state"] == "closed"
+    assert "bar=2026-09-11" in rep.summary_line
+
+
+def test_a_settled_trading_day_does_not_claim_the_market_is_closed(monkeypatch):
+    """Fri 20:00 IST with Friday's settled bar: a normal quiet EOD cycle."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    rep = _quiet_cycle(monkeypatch, now=datetime(2026, 9, 11, 20, 0, tzinfo=ZoneInfo(TZ)),
+                       bar=pd.Timestamp("2026-09-11"))
+    assert rep.bar_session == rep.session_now == "2026-09-11"
+    assert rep.trading_day is True
+    assert not any(n.startswith(("MARKET CLOSED", "NO FRESH SESSION", "FEED BEHIND"))
+                   for n in rep.notes), rep.notes
+
+
+def test_a_closed_bar_cycle_mid_session_names_the_previous_session(monkeypatch):
+    """A forced ``--eod`` at 10:00 reads yesterday — and must say so instead of
+    implying today's session was scanned and found wanting."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    rep = _quiet_cycle(monkeypatch, now=datetime(2026, 9, 11, 10, 0, tzinfo=ZoneInfo(TZ)),
+                       bar=pd.Timestamp("2026-09-10"), live=False)
+    assert rep.market_state == "open"
+    note = [n for n in rep.notes if n.startswith("NO FRESH SESSION")]
+    assert note, rep.notes
+    assert "2026-09-10" in note[0]
+    assert not any(n.startswith("MARKET CLOSED") for n in rep.notes), rep.notes
+
+
+def test_a_feed_behind_the_session_it_should_have_is_named(monkeypatch):
+    """Saturday, but the newest bar is Wednesday: that is a lagging feed (or a
+    holiday), not a quiet market, and it must not be reported as one."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    rep = _quiet_cycle(monkeypatch, now=datetime(2026, 9, 12, 14, 18, tzinfo=ZoneInfo(TZ)),
+                       bar=pd.Timestamp("2026-09-09"))
+    assert rep.expected_session == "2026-09-11"
+    assert rep.bar_session < rep.expected_session
+    note = [n for n in rep.notes if n.startswith("FEED BEHIND")]
+    assert note, rep.notes
+    assert "2026-09-09" in note[0] and "2026-09-11" in note[0]
+    assert not any(n.startswith("MARKET CLOSED") for n in rep.notes), rep.notes
+
+
+def test_the_quiet_note_names_the_bar_it_looked_at(monkeypatch):
+    """`recent_bars: 1` makes "which bar?" the whole question — so the
+    "nothing to send" note carries the date instead of just "a quiet session"."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    rep = _quiet_cycle(monkeypatch, now=datetime(2026, 9, 12, 14, 18, tzinfo=ZoneInfo(TZ)),
+                       bar=pd.Timestamp("2026-09-11"))
+    assert rep.events_in_window == 0
+    note = [n for n in rep.notes if n.startswith("nothing to send — no indicator signal")]
+    assert note, rep.notes
+    assert "newest 2026-09-11" in note[0]
+    assert "quiet session" not in note[0]                # there was no session at all
+
+
+def test_a_widened_window_says_how_many_bars_it_covered(monkeypatch):
+    """The same note must stay honest when the window is widened."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    rep = _quiet_cycle(monkeypatch, now=datetime(2026, 9, 12, 14, 18, tzinfo=ZoneInfo(TZ)),
+                       bar=pd.Timestamp("2026-09-11"), recent_bars=3)
+    note = [n for n in rep.notes if n.startswith("MARKET CLOSED")]
+    assert note and "recent_bars=3" in note[0], rep.notes
+
+
+def test_the_cli_says_which_session_a_silent_cycle_evaluated(monkeypatch, tmp_path, capsys):
+    """The console is what a human reads first: `scan` on a Saturday must name
+    the bar it evaluated instead of only printing "alerts matched: 0"."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    import precision_tap.data as D
+    import precision_tap.scanner as SC
+    from precision_tap.cli import cmd_scan
+    from precision_tap.data import Bars
+
+    sat = datetime(2026, 9, 12, 14, 18, tzinfo=ZoneInfo(TZ))
+
+    def _pinned(tz: str = TZ):
+        return sat if tz == TZ else sat.astimezone(ZoneInfo(tz))
+
+    monkeypatch.setattr(D, "_now_tz", _pinned)
+    monkeypatch.setattr(SC, "_session_now", _pinned)
+
+    df = synthetic_frame(n=400, seed=3)
+    df = df.set_axis(df.index + (pd.Timestamp("2026-09-11") - df.index[-1]))
+    monkeypatch.setattr(D.DataSource, "get_many",
+                        lambda self, symbols, **kw: {
+                            s: Bars(symbol=s, df=df, live=False, source="fake")
+                            for s in symbols})
+
+    class A:
+        config = None
+        set = ["data.provider=yfinance", "data.universe=RELIANCE.NS,TCS.NS",
+               "data.min_bars=90", f"data.cache_dir={tmp_path / 'cache'}",
+               f"out_dir={tmp_path / 'out'}", "state_db=:memory:", "alerts.chart=false",
+               "telegram.enabled=false"]
+        env_file = None
+        symbols = None
+        days = None
+        provider = None
+        limit = None
+        events = None
+        recent_bars = None
+        no_charts = True
+        min_dollar_volume = None
+        trigger = target_r = stop_mode = trail = time_stop = risk = capital = max_positions = None
+        live = False
+        eod = False
+        end = None
+        no_send = True
+        report_only = False
+        retried = False
+        messages = False
+        top = 5
+        workers = 1
+
+    assert cmd_scan(A()) == 0                            # a closed market is not a failure
+    out = capsys.readouterr().out
+    assert "bar=2026-09-11" in out                       # the summary line carries the bar
+    assert "session: evaluated 2026-09-11 · today is 2026-09-12" in out
+    assert "not a trading day" in out
+    assert "MARKET CLOSED" in out
+
+
+def test_a_frozen_replay_does_not_comment_on_the_exchange_clock(monkeypatch, tmp_path):
+    """``--provider csv`` / a historical ``--end`` is frozen by definition, so
+    "today" means nothing to it: it must not be told the market is closed."""
+    import precision_tap.data as D
+    from precision_tap.data import Bars
+    from precision_tap.params import DataConfig
+
+    df = synthetic_frame(n=400, seed=3)
+    monkeypatch.setattr(D.DataSource, "get_many",
+                        lambda self, symbols, **kw: {
+                            s: Bars(symbol=s, df=df, live=False, source="csv:x.csv")
+                            for s in symbols})
+    cfg = scan_cfg()
+    cfg.data = DataConfig(provider="csv", universe=list(cfg.data.universe), min_bars=90,
+                          lookback_days=600, cache_dir=str(tmp_path / "cache"))
+    with StateStore(":memory:") as store:
+        sc = Scanner(cfg, store=store, dry_run=True)
+        rep = sc.scan(live=False, progress=False)
+        sc.close()
+    assert rep.usable > 0, rep.notes
+    assert rep.market_state == "" and rep.expected_session == ""
+    assert rep.bar_session                       # still reported, for the step summary
+    assert not any(n.startswith(("MARKET CLOSED", "NO FRESH SESSION", "FEED BEHIND"))
+                   for n in rep.notes), rep.notes
+
+
+def test_a_weekday_holiday_reports_the_feed_as_behind(monkeypatch):
+    """Mon 2026-09-14 is Ganesh Chaturthi — a weekday the exchange is shut.
+
+    The scanner has no holiday calendar (``live.trading_days`` only knows
+    weekends), so the honest report is "the feed is behind the session it should
+    already have, and a holiday explains it" — not "market closed", and not
+    silence.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    rep = _quiet_cycle(monkeypatch, now=datetime(2026, 9, 14, 20, 0, tzinfo=ZoneInfo(TZ)),
+                       bar=pd.Timestamp("2026-09-11"))
+    assert rep.trading_day is True
+    assert rep.session_now == "2026-09-14"
+    assert rep.expected_session == "2026-09-14"
+    note = [n for n in rep.notes if n.startswith("FEED BEHIND")]
+    assert note, rep.notes
+    assert "holiday" in note[0] and "2026-09-11" in note[0]
+    assert not any(n.startswith("MARKET CLOSED") for n in rep.notes), rep.notes
