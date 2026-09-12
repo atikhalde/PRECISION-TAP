@@ -83,7 +83,7 @@ def test_suffix_applied_and_frame_normalised(fake_yf, tmp_path):
     assert FakeTicker.calls[0]["auto_adjust"] is True
 
 
-def test_live_mode_merges_intraday_bar(fake_yf, tmp_path):
+def test_live_mode_merges_intraday_bar(fake_yf, tmp_path, exchange_clock):
     cfg = DataConfig(provider="yfinance", symbol_suffix=".NS", min_bars=50, live_intraday_bar=True,
                      intraday_interval="5m", cache_dir=str(tmp_path / "cache"),
                      cache_max_age_minutes=0, lookback_days=400)

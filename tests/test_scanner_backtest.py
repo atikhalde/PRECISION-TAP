@@ -105,7 +105,11 @@ def test_session_and_staleness_helpers():
     assert _market_open("Asia/Kolkata", pd.Timestamp("2024-06-01 11:00").to_pydatetime()) is False  # Sat
     assert _market_open("Asia/Kolkata", pd.Timestamp("2024-06-03 16:00").to_pydatetime(),
                         session=("09:15", "17:00")) is True
-    assert _same_session(pd.Timestamp.now(), "Asia/Kolkata") is True
+    # tz-aware: a naive now() is read as the runner's UTC date, which differs from
+    # the IST session date after 18:30Z — that made this assertion a clock flake.
+    assert _same_session(pd.Timestamp.now(tz="Asia/Kolkata"), "Asia/Kolkata") is True
+    assert _same_session(pd.Timestamp.now(tz="Asia/Kolkata") - pd.Timedelta(days=1),
+                         "Asia/Kolkata") is False
 
 
 def test_backtest_matches_engine_events(demo_data):

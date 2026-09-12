@@ -48,6 +48,16 @@ def _today():
     return pd.Timestamp.now(tz=TZ).normalize()
 
 
+def _last_session():
+    """:func:`_today` rolled onto the most recent trading weekday — the session
+    the provider fixtures stamp their prints into (and what ``exchange_clock``
+    pins "now" to), so this test is not hostage to the host's calendar."""
+    d = _today()
+    while d.weekday() >= 5:
+        d -= pd.Timedelta(days=1)
+    return d
+
+
 def _quiet_bars(df: pd.DataFrame, count: int = 2) -> pd.DataFrame:
     """Append unchanged bars, pushing the last real signal onto a closed bar."""
     c = float(df["close"].iloc[-1])
@@ -167,7 +177,8 @@ def test_cache_freshness_is_judged_by_session_not_ttl(tmp_path):
     assert csv._cache_usable(stale, None) is True
 
 
-def test_live_and_closed_bar_fetches_use_separate_cache_entries(tmp_path, monkeypatch):
+def test_live_and_closed_bar_fetches_use_separate_cache_entries(tmp_path, monkeypatch,
+                                                                exchange_clock):
     """A live scan must never be handed a frame cached by a closed-bar scan."""
     from test_providers import FakeTicker          # the fake yfinance module
 
@@ -191,7 +202,10 @@ def test_live_and_closed_bar_fetches_use_separate_cache_entries(tmp_path, monkey
     assert len(FakeTicker.calls) > n_after_eod, "live scan reused the closed-bar cache"
     assert live.source == "yfinance+intraday"
     assert live.live is True
-    assert pd.Timestamp(live.df.index[-1]).date() == _today().date()
+    # the merged bar is stamped with the session FakeTicker built its prints from
+    # (_last_session); under exchange_clock the provider agrees, so this holds on
+    # a weekend — a raw _today() here only matched on weekday afternoons.
+    assert pd.Timestamp(live.df.index[-1]).date() == _last_session().date()
 
 
 def test_a_cache_hit_is_only_live_when_it_holds_todays_bar(tmp_path):
