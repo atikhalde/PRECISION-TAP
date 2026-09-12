@@ -50,6 +50,7 @@ def _skip_bucket(why: str) -> str:
                        ("min_price", "below min_price"),
                        ("max_price", "above max_price"),
                        ("zone age", "zone too old"),
+                       ("failed on the same bar", "level already failed"),
                        ("already alerted", "already alerted"),
                        ("repeat tap", "repeat tap"),
                        ("not enabled", "event type disabled")):
@@ -457,8 +458,23 @@ class Scanner:
         # frame with the last bar *closed* and keeps the events the indicator
         # would already have printed — including every `confirmed`, which can
         # never come from the intrabar pass.
-        if live and self.cfg.alert.match_indicator_100:
-            closed = run_engine(df, p, symbol=symbol, intrabar_last=False)
+        if live and self.cfg.alert.match_indicator_100 and len(df) > 1:
+            # Replay the *closed* history only — ``df.iloc[:-1]``, so the bar the
+            # pass ends on really is the last completed session.
+            #
+            # Running it over the whole frame with the last bar treated as closed
+            # let today's still-forming bar keep mutating the shared ``Zone``
+            # objects *after* the event had been emitted.  ``Event.zone`` is a
+            # live reference, not a snapshot, so by render time an alert about
+            # yesterday's tap printed today's tap count, today's raised pre-order
+            # and even ``state=dead`` — a message describing a zone that no
+            # longer looked like the one the signal fired on.
+            #
+            # Every series the engine reads at bar i is backward-looking, so
+            # truncating changes no event *set*: the events at the last closed
+            # bar are identical, only the state they carry is now the state that
+            # bar actually had.
+            closed = run_engine(df.iloc[:-1], p, symbol=symbol, intrabar_last=False)
             st.events_closed = [e for e in closed.events if not e.intrabar]
         A = res.arrays
         i = len(df) - 1
@@ -509,9 +525,28 @@ class Scanner:
     def _context(self, st: SymbolScan, ev: Event) -> Dict[str, Any]:
         res, df = st.result, st.df
         meta = getattr(st, "meta", {}) or {}
+        n = len(df) if df is not None else 0
+        # An alert has to describe the bar its signal fired on.  ``st.price`` /
+        # ``st.atr`` / ``st.rvol`` are always the *newest* bar's, but a
+        # closed-bar parity event sits on the last completed session — which in
+        # live mode is the bar *before* the forming one.  Printing those together
+        # produced a message dated yesterday next to today's live price and
+        # today's change: two different bars in one alert.
+        i = n - 1
+        if ev is not None and n and 0 <= int(ev.bar) < n:
+            i = int(ev.bar)
+        price, atr, rvol, change = st.price, st.atr, st.rvol, st.change_pct
+        A = getattr(res, "arrays", None)
+        if A is not None and n:
+            price = float(A["close"][i])
+            atr = float(A["atr"][i]) if np.isfinite(A["atr"][i]) else float("nan")
+            rvol = float(A["rvol"][i])
+            change = (float((A["close"][i] / A["close"][i - 1] - 1.0) * 100.0) if i
+                      else float("nan"))
         ctx: Dict[str, Any] = {
-            "price": st.price, "change_pct": st.change_pct, "atr": st.atr, "rvol": st.rvol,
-            "timeframe": self.cfg.data.interval, "last_bar": st.last_date,
+            "price": price, "change_pct": change, "atr": atr, "rvol": rvol,
+            "timeframe": self.cfg.data.interval,
+            "last_bar": str(df.index[i])[:10] if n else st.last_date,
             "exchange": exchange_label(meta.get("fullExchangeName") or meta.get("exchangeName")
                                        or self.cfg.alert.default_exchange),
             "currency": meta.get("currency", "USD"), "zone_method": self.cfg.params.zone_method,
@@ -521,8 +556,15 @@ class Scanner:
             z = ev.zone
             ctx["entry"] = z.entry
             ctx["origin_date"] = str(df.index[z.origin])[:10] if df is not None and z.origin < len(df) else ""
-        vol = df["volume"].tail(21).to_numpy(float) if df is not None else np.array([])
-        px = df["close"].tail(21).to_numpy(float) if df is not None else np.array([])
+        # 20-session median turnover, measured on *completed* sessions only.  In
+        # live mode the newest row is today's forming bar, whose
+        # few-percent-of-a-day volume would otherwise enter the median and make
+        # the liquidity floor stricter at 09:35 than at 15:30 — the same symbol
+        # could pass after the close and fail during the session.
+        end_i = max(0, n - 2) if (st.live and n > 1) else max(0, n - 1)
+        lo = max(0, end_i - 20)
+        vol = df["volume"].iloc[lo:end_i + 1].to_numpy(float) if n else np.array([])
+        px = df["close"].iloc[lo:end_i + 1].to_numpy(float) if n else np.array([])
         if len(vol) >= 5:
             ctx["avg_dollar_volume"] = float(np.median(vol[1:] * px[1:]))
         return ctx

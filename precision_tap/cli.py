@@ -364,9 +364,18 @@ def cmd_run(args) -> int:
     with _store(cfg) as store:
         sc = _scanner(cfg, dry_run=dry, store=store)
         from .live import LiveLoop
+        # `--duration 0` means "no deadline" (run until a signal), so a computed
+        # duration that came out <= 0 must never be passed here: it would silently
+        # turn a bounded CI segment into an infinite loop that only the runner's
+        # own timeout can stop.  Callers compute the budget and fall back to
+        # `--once` when the window has already closed.
+        duration = float(args.duration or 0.0)
+        if duration < 0:
+            print(f"--duration {duration:g} is negative — treating it as --once", file=sys.stderr)
+            duration = 0.0
         loop = LiveLoop(cfg, sc, store=store, heartbeat=not args.no_heartbeat,
                         max_cycles=args.max_cycles,
-                        stop_after=(time.monotonic() + args.duration) if args.duration else None)
+                        stop_after=(time.monotonic() + duration) if duration > 0 else None)
         try:
             if args.once:
                 rep = loop._scan("once")
@@ -391,7 +400,42 @@ def cmd_run(args) -> int:
                     print(msg, file=sys.stderr)
                     return rc
                 return 0
-            return loop.run()
+            rc = loop.run()
+            if rc:
+                return rc
+            # A long-lived loop covers a whole session in one process, so the
+            # per-cycle exit codes `scan` and `run --once` rely on never reach
+            # the scheduler.  Report the accumulated outcome instead — otherwise
+            # a job that matched taps all afternoon and delivered none still
+            # exits 0, and the run looks green while the chat stays empty.
+            #
+            # `explicit_dry` deliberately mirrors `_undelivered_exit` and does
+            # NOT include the auto-detected `dry`: "there was no transport" is
+            # exactly the broken-pipeline case that must be red (cron and systemd
+            # start with an empty environment, so the token silently expands to
+            # nothing).  Only a dry run the caller *asked* for is forgiven — and
+            # folding `dry` in here would make the log_only branch unreachable,
+            # because log-only alerts can only happen when `dry` is true.
+            explicit_dry = bool(args.no_send or cfg.alert.quiet_log_only)
+            if loop.undelivered:
+                print(f"\nRUN FAILED: {loop.undelivered} alert(s) found across "
+                      f"{loop.cycles} cycle(s) but NOT delivered — Telegram "
+                      "rejected the send or was unreachable. Run "
+                      "`python -m precision_tap telegram-test`, then `livecheck`.",
+                      file=sys.stderr)
+                return 4
+            if loop.log_only and not explicit_dry:
+                print(f"\nRUN FAILED: {loop.log_only} alert(s) found across "
+                      f"{loop.cycles} cycle(s) but nothing could send them — "
+                      "telegram.enabled / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID "
+                      "are not usable here (cron and systemd need the env file — "
+                      "see deploy/README.md).", file=sys.stderr)
+                return 4
+            if loop.failed_cycles and loop.failed_cycles >= loop.cycles:
+                print(f"\nRUN FAILED: all {loop.cycles} cycle(s) crashed — see the log",
+                      file=sys.stderr)
+                return 1
+            return 0
         finally:
             sc.close()
 

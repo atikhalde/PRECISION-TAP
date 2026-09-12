@@ -104,6 +104,13 @@ alerts:
   min_price: 20
   max_price: 0
   max_age_bars: 0
+  # A tap whose own bar closed through the stop already failed: the level was
+  # touched and broken in the same session, so a "Buy limit / Stop / R1-R3"
+  # alert would describe a trade that is dead on arrival (and the invalidation
+  # that proves it is not sent, see include_invalidations).  The engine still
+  # records the tap exactly as Pine's `anyTap` does — this only decides whether
+  # it is worth pinging you.  Set false for strict indicator parity.
+  skip_dead_on_arrival: true
   daily_limit: 0
   quiet_log_only: false
   chart: true

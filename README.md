@@ -78,10 +78,20 @@ python -m precision_tap doctor --net      # deps, universe, tz/session, token+ch
 python -m precision_tap selftest          # 18 Pine-parity checks (offline, deterministic)
 python -m precision_tap demo              # full offline pipeline on synthetic NSE-style data
 python tools/live_drill.py                # the LIVE path offline: fake Yahoo feed → mock Telegram
+python tools/signal_audit.py              # are the alerts *valid*? realistic (not engineered) market
 python -m precision_tap scan --no-send    # one real cycle, prints instead of sending
 python -m precision_tap livecheck         # config → real Telegram → real feed → one real cycle
 python -m precision_tap verify RELIANCE.NS   # every zone + every event, for TradingView diffing
 ```
+
+`tools/signal_audit.py` is the answer to *"are the alerts it sends actually any good?"*. The other
+offline tools all run on `data.synthetic_frame`, which plants a displacement → OB → Tap-1 sequence
+every 41 bars, so they can never tell you what a real market does. The audit generates data shaped
+like real NSE dailies instead (volatility clustering, autocorrelated volume, no planted setups) and
+reports the gate pass-through, the alert rate a 127-name universe should expect per day — so "quiet
+chat" can be compared against a number — and a validity grade for every alert the scanner would
+actually send: did the bar touch the level, was the zone alive, is the advertised stop already
+breached, did price run away from the entry.
 
 `livecheck` is the answer to *"is it actually working on the live market?"*. It talks to the real
 Bot API and the real data provider, sends one test message, and prints a per-stage PASS/FAIL —
@@ -201,25 +211,50 @@ Add two repository secrets and it is live:
 | `SCAN_EVENTS` *(variable, optional)* | e.g. `tap1` to cut the volume |
 | `SCAN_MIN_DV` *(variable, optional)* | 20d median turnover floor in ₹ crore |
 
-It fires every 15 minutes across the NSE session plus four post-close scans (29 runs per weekday,
-09:15–17:00 IST), and you can also start one by hand from the **Actions** tab with a forced
-`live`/`eod` mode and a dry-run toggle. Each run picks its mode from the exchange clock exactly as
-`scan` does, so a UTC runner behaves like an `Asia/Kolkata` host.
+**It does *not* rely on cron for the cadence.** Cron is used only to *kick* the job; the job then
+owns the session itself with the same always-on loop as `run` — intraday polling every
+`live.intraday_poll_minutes` plus the `live.scan_times` closed-bar prints, each cycle picking
+live-vs-closed-bar from the exchange clock. You can also start one by hand from the **Actions** tab
+(one cycle by default, or the whole session with `loop=true`), with a forced `live`/`eod` mode and a
+dry-run toggle.
 
-Two things to know before you rely on it:
+Why the change matters: this workflow used to declare 29 cron slots a day, one every 15 minutes
+across the session. Measured on its first trading day, **15 slots were due, 5 fired, every one of
+them 1–4 hours late, and not one landed inside the NSE session** — so the intraday tap stream, the
+entire point of the product, never executed, while all 5 runs reported success. GitHub's `schedule`
+trigger is explicitly best-effort: it delays under load, drops runs when load stays high, and
+deprioritises low-traffic repositories. Fifteen precise slots is fifteen independent chances to be
+skipped; one kick that covers hours needs only one.
+
+Five staggered kicks (09:05 / 11:25 / 13:05 / 14:55 / 15:25 / 16:15 IST, at off-the-hour minutes
+because the top of the hour is GitHub's documented high-load moment) each run until 17:20 IST or
+the 5h30m job cap, handing over to one another through the `concurrency` queue. A kick that starts
+after the window has closed degrades to a single catch-up cycle, so redundancy costs about a minute
+each and the ledger makes them idempotent. Coverage degrades instead of collapsing:
+
+| kicks that reach a runner | session covered | post-close prints | digest |
+|---|---|---|---|
+| all six | 100% | ✔ | ✔ |
+| any one of 11:25 / 13:05 / 14:55 / 15:25 / 16:15 | partial | ✔ | ✔ |
+| only 09:05 | 85% (09:05→14:35) | ✘ | ✘ |
+| none | — | ✘ | ✘ |
+
+Three things to know before you rely on it:
 
 * **The dedupe ledger is carried between runs with `actions/cache`.** Runners are ephemeral, and
-  `data/state.sqlite3` is the only thing that stops the same Tap 1 being re-sent every 15 minutes.
+  `data/state.sqlite3` is the only thing that stops the same Tap 1 being re-sent by the next cycle.
   A cache miss is survivable but re-delivers that day's alerts once — the run says so in a
   `::warning::` annotation rather than failing silently.
-* **GitHub's cron is best-effort.** The documented floor is 5 minutes and starts are frequently
-  delayed 5–15 minutes, longer at the top of the hour; a run can be skipped entirely under load.
-  A delayed intraday cycle simply lands in closed-bar mode (still correct, just later). For
-  alerts you must not miss, prefer the systemd/Docker loop above — this workflow is the
-  zero-maintenance option, not the lowest-latency one.
+* **GitHub's cron can still drop every kick.** Five independent chances is far better than fifteen
+  fragile ones, but it is not a guarantee, and the `only 09:05` row above is a real residual gap.
+  For alerts you must not miss, run the systemd/Docker loop on a host you own — this workflow is
+  the zero-maintenance option, not the guaranteed one.
+* **A session loop holds one runner for hours.** Free on public repos; on a private repo that is a
+  large slice of the 2000 min/month allowance — lower `JOB_CAP_MINUTES` or trim the universe with
+  `SCAN_LIMIT`.
 
-A failing run posts to Telegram, and the 17:00 IST cycle posts an end-of-day digest so a quiet
-market is visibly different from a dead pipeline.
+A failing run posts to Telegram, and the first job to finish after 16:40 IST posts an end-of-day
+digest (idempotent through the ledger) so a quiet market is visibly different from a dead pipeline.
 
 
 ## 7. Backtesting
@@ -286,9 +321,12 @@ cycle against the live market and prints `RESULT: PASS` or names the first thing
 | `DELIVERY PROBLEM — … 401 Unauthorized` / `400 chat not found` / `403 bot can't initiate…` | permanent Telegram rejection: the token is wrong, the chat id is wrong, or you never pressed **Start** on the bot (in a group, add it and make it an admin). It is logged at ERROR and *not* retried; fix the credential and the alert is re-offered on the next cycle |
 | `cycle … → delivery sent=0` in the log | the always-on loop now logs the delivery outcome separately from the signal count — a cycle that found three taps and delivered none no longer looks healthy |
 | No alerts at all, ever | first separate *quiet* from *broken*: the cycle summary says which — `nothing to send … no indicator signal` is a quiet market; `usable=0` / `UNIVERSE EMPTY` / `DELIVERY PROBLEM` is a broken pipeline. Then remember the default window is deliberately one bar (`alerts.recent_bars: 1`) and Taps need a zone that is ≥3 bars old, was left by ≥1 ATR and is revisited *on the newest bar* — on a quiet session even 500 names can legitimately produce zero taps. Widen honestly: `alerts.recent_bars: 2-3`, add `new_ob`/`approach` to `alerts.events`, lower `alerts.min_liquidity_dollar_volume` (₹500cr muted the entire mid/small-cap market — the default is now ₹25cr), and scan the broad market (`universe_file: nifty500` or `allnse`) instead of a 127-name starter file. `verify SYM` shows what the engine sees |
+| GitHub Actions runs are green but no alerts ever arrive, and the run times look random | `schedule` is **best-effort** — this repo measured 15 due slots, 5 fired, all 1–4 h late, none inside the NSE session, every run reporting success. The workflow no longer asks cron for a cadence: cron only *kicks* the job (09:05 / 11:25 / 13:05 / 14:55 / 15:25 / 16:15 IST) and the job runs the always-on loop until 17:20 IST or the 5h30m cap. Check `gh run list --workflow=live-scan.yml` for the `schedule` rows against those times; if a whole day is missing, GitHub dropped every kick — for a guarantee run systemd/Docker (`deploy/README.md`) |
+| Alert says `TAP 1` but the zone is already broken | that was a *dead-on-arrival* tap: the same bar touched the entry **and** closed below the stop, so the level failed at the moment it was tapped, and with `include_invalidations: false` the failure was never sent — only the buy side was. `alerts.skip_dead_on_arrival: true` (default) drops them and the cycle tally says `level already failed N`. Set it `false` for strict Pine `anyTap` parity |
+| An alert about yesterday's bar shows today's price / tap count | the live closed-bar parity pass used to replay the whole frame with today's *forming* bar treated as closed, and `Event.zone` is a live reference — so yesterday's alert was rendered with today's tap count, today's raised pre-order, even `state=dead`. The pass now replays `df.iloc[:-1]` and the alert context is taken from the event's own bar (`tests/test_alert_validity.py`) |
 | Want the full NSE market scanned | `data.universe_file: nifty500` (default) covers ~92% of NSE market cap; `allnse` pulls every listed equity (~2 000+ symbols — EOD cycle ≈ 8 min at the default 5 req/s, intraday ≈ double; keep `live.intraday_poll_minutes` ≥ 15 and the workflow timeout at 45 min). nseindia downloads fail from datacenter IPs — the presets fall back to Wikipedia; from a local machine they hit the official CSVs |
 | `alerts matched: 0` but zones are found | read the `nothing to send — …` note at the end of the cycle: it tallies *why* every event was dropped (`illiquid 12 · event type disabled 6`). A quiet market plus a ₹500 crore turnover floor plus `tap1`-only often filters everything; `--min-dollar-volume 100` or `--events tap1,approach,confirmed,tap` widens it |
-| `scan --no-send` shows alerts but `run` sends nothing | `.env` is missing/unreadable, so `run` falls back to log-only. It says so once at startup, on every cycle, and now **exits 4** from `scan`/`run --once`; `doctor` prints the token/chat status. Under cron/systemd the process environment is empty — put the secrets in `/etc/precision-tap.env` (also honoured via `PRECISION_TAP_ENV_FILE`) so the scanner can read them without a shell profile |
+| `scan --no-send` shows alerts but `run` sends nothing | `.env` is missing/unreadable, so `run` falls back to log-only. It says so once at startup, on every cycle, and now **exits 4** — from `scan` and `run --once` immediately, and from a `run --duration` session loop once at the end, since one process covers the whole session and the per-cycle code never reaches the scheduler. `doctor` prints the token/chat status. Under cron/systemd the process environment is empty — put the secrets in `/etc/precision-tap.env` (also honoured via `PRECISION_TAP_ENV_FILE`) so the scanner can read them without a shell profile |
 | Alert chart shows no order block / no `TAP` marker | the overlay is drawn on a truncated window (`alerts.chart_bars` bars) and had to be rebased onto it — a zone born at bar 596 of a 600-bar frame landed off-canvas. Boxes, entry/stop lines and the marker are placed relative to the first *drawn* bar now (`tests/test_alert_chart.py`) |
 | Cycle runs every 10 min but the notes say `skipped` | the feed's newest bar is not a recent session (`skip_stale_bars`). Check `data.provider`, the yfinance version, and `doctor --net` |
 | Alerts repeat yesterday's session | the intraday rebuild failed, so today's bar is missing; the stale guard then suppresses it. Check `data.live_intraday_bar` / `data.intraday_interval` |

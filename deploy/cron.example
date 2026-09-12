@@ -2,6 +2,13 @@
 # NSE session is 09:15–15:30 IST. Times below are IST; make sure the host clock is
 # Asia/Kolkata (or set TZ=) or convert to your server's timezone.
 #
+# Unlike GitHub Actions' `schedule` trigger — which is best-effort, routinely
+# delayed by hours and drops runs under load (see .github/workflows/live-scan.yml,
+# where that cost an entire session of intraday scans) — a real crontab fires when
+# you tell it to. A 15-minute cadence is therefore safe *here* and is not safe
+# there. Even so, `run` (the always-on loop) is the better choice on a host you
+# own: one process, no per-invocation start-up, and no gap if a cycle runs long.
+#
 #   crontab -e   →   TZ=Asia/Kolkata
 TZ=Asia/Kolkata
 PATH=/opt/precision-tap/.venv/bin:/usr/local/bin:/usr/bin:/bin

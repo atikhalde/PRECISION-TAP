@@ -19,7 +19,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .engine import EV_APPROACH, EV_CONFIRMED, EV_INVALID, EV_NEW, EV_TAP, Event, Zone
+from .engine import (EV_APPROACH, EV_CONFIRMED, EV_INVALID, EV_NEW, EV_TAP, ST_DEAD,
+                     Event, Zone)
 from .params import AlertConfig
 from .telegram import TelegramClient, escape_markdownv2, strip_html
 
@@ -96,6 +97,16 @@ def passes_filters(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, *,
     if cfg.min_liquidity_dollar_volume and adv < cfg.min_liquidity_dollar_volume:
         return False, f"illiquid (${adv/1e6:.1f}M/day < ${cfg.min_liquidity_dollar_volume/1e6:.0f}M)"
     z = ev.zone
+    # A tap whose own bar closed through the stop is not an actionable signal:
+    # the level failed at the same moment it was touched, so the rendered
+    # "Buy limit / Stop / R1–R3" block describes a trade that was already dead
+    # on arrival — and the invalidation that proves it is off by default
+    # (`include_invalidations: false`), so the user would see the buy alert and
+    # never the failure.  The engine still records the tap exactly as Pine's
+    # `anyTap` does; this is an alert-layer decision only.
+    if cfg.skip_dead_on_arrival and ev.kind == EV_TAP and z is not None \
+            and z.state == ST_DEAD and z.dead_bar == ev.bar:
+        return False, f"level failed on the same bar ({z.dead_reason or 'invalid'})"
     if z is not None and cfg.max_age_bars and (ev.bar - z.born) > cfg.max_age_bars:
         return False, f"zone age {ev.bar - z.born} > max_age_bars {cfg.max_age_bars}"
     if already_seen is not None and already_seen(ev):

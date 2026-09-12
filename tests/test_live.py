@@ -274,20 +274,70 @@ def test_historical_replay_is_exempt_from_the_stale_guard(monkeypatch):
 # closed-bar parity pass (alerts.match_indicator_100)
 # ─────────────────────────────────────────────────────────────────────────────
 def test_live_scan_populates_the_closed_bar_parity_pass(monkeypatch):
-    """Live mode must also replay the frame with the last bar closed, so events
-    the indicator has *already* printed — every ``confirmed``, which can never
-    come from the forming bar — remain deliverable."""
+    """Live mode must also replay the *closed* history, so events the indicator
+    has already printed — every ``confirmed``, which can never come from the
+    forming bar — remain deliverable."""
     patch_source(monkeypatch)
     sc = Scanner(scan_cfg(), store=None, dry_run=True)
     bars = sc.source.get("RELIANCE.NS")
     st = sc._scan_frame("RELIANCE.NS", bars, live=True)
     p = sc._params_for("RELIANCE.NS")
-    closed = run_engine(bars.df, p, symbol="RELIANCE.NS", intrabar_last=False, zone_cap=10 ** 6)
+    n = len(bars.df)
+    closed = run_engine(bars.df.iloc[:-1], p, symbol="RELIANCE.NS",
+                        intrabar_last=False, zone_cap=10 ** 6)
     want = {(e.kind, e.bar, e.zid) for e in closed.events if not e.intrabar}
     got = {(e.kind, e.bar, e.zid) for e in st.events_closed}
     assert got == want
     assert want, "fixture should contain closed-bar events"
     assert all(not e.intrabar for e in st.events_closed)
+    sc.close()
+
+
+def test_parity_pass_never_closes_the_forming_bar(monkeypatch):
+    """The parity pass must stop on the last *completed* session.
+
+    Replaying the whole frame with the forming bar treated as closed emits a
+    signal for a bar that has not finished — a tap that TradingView's "Once Per
+    Bar Close" alert could never have printed, computed from a partial low.
+    """
+    patch_source(monkeypatch)
+    sc = Scanner(scan_cfg(), store=None, dry_run=True)
+    bars = sc.source.get("RELIANCE.NS")
+    st = sc._scan_frame("RELIANCE.NS", bars, live=True)
+    n = len(bars.df)
+    assert st.events_closed, "fixture should contain closed-bar events"
+    assert all(e.bar <= n - 2 for e in st.events_closed), \
+        [e.bar for e in st.events_closed if e.bar > n - 2]
+    sc.close()
+
+
+def test_parity_event_zone_state_is_not_polluted_by_the_forming_bar(monkeypatch):
+    """``Event.zone`` is a live reference, so the parity pass must not keep
+    mutating it after the event's own bar.
+
+    A tap today increments ``zone.taps``, lifts ``zone.entry`` and can mark the
+    zone dead — none of which had happened when yesterday's signal fired.  An
+    alert about the last closed bar therefore has to carry the state that bar
+    actually saw.
+    """
+    patch_source(monkeypatch)
+    sc = Scanner(scan_cfg(), store=None, dry_run=True)
+    bars = sc.source.get("RELIANCE.NS")
+    st = sc._scan_frame("RELIANCE.NS", bars, live=True)
+    p = sc._params_for("RELIANCE.NS")
+    n = len(bars.df)
+    # ground truth: the same pass, stopped at the last closed bar
+    ref = run_engine(bars.df.iloc[:-1], p, symbol="RELIANCE.NS", intrabar_last=False)
+    ref_by = {(e.kind, e.bar, e.zid): e for e in ref.events if not e.intrabar}
+    assert ref_by, "fixture should contain closed-bar events"
+    for e in st.events_closed:
+        r = ref_by[(e.kind, e.bar, e.zid)]
+        assert e.zone.taps == r.zone.taps, f"{e.kind}@{e.bar} taps drifted"
+        assert e.zone.state == r.zone.state, f"{e.kind}@{e.bar} state drifted"
+        assert e.zone.entry == r.zone.entry, f"{e.kind}@{e.bar} entry drifted"
+    # and the whole-frame pass would have differed — otherwise this pins nothing
+    full = run_engine(bars.df, p, symbol="RELIANCE.NS", intrabar_last=False)
+    assert len(full.events) > len(st.events_closed)
     sc.close()
 
 
@@ -524,6 +574,157 @@ def test_run_once_is_live_during_the_session(loop_clock):
     assert sc.calls == [(clock.now, True)]
 
 
+def test_loop_stops_at_the_deadline_without_overshooting(loop_clock):
+    """`--duration` is how CI hands a session segment to one job.
+
+    `_sleep_seconds` is capped at an hour, so an uncapped sleep sails straight
+    past `stop_after`: a job asked to cover 100 minutes used to run 120 and eat
+    into the runner's own timeout, which is how a session-covering job gets
+    killed before it can checkpoint the ledger.
+    """
+    import precision_tap.live as L
+    cfg = scan_cfg(live={"intraday_poll_minutes": 0, "scan_times": [],
+                         "run_on_startup": False, "heartbeat_daily_time": ""})
+    clock = loop_clock(datetime.fromisoformat("2026-09-11T09:00:00"))
+    sc = FakeScanner(cfg, clock)
+    budget = 100 * 60                      # deliberately not a multiple of the 30-min idle sleep
+    start = clock.monotonic()
+    L.LiveLoop(cfg, sc, stop_after=start + budget).run()
+    elapsed = clock.monotonic() - start
+    assert elapsed <= budget + 1, f"overshot the deadline by {elapsed - budget:.0f}s"
+
+
+def test_an_expired_duration_budget_breaks_instead_of_spinning(loop_clock):
+    """A spent `--duration` must exit, not busy-loop.
+
+    Capping the sleep at the remaining budget is not enough: once the budget is
+    exactly 0 nothing advances the monotonic clock any more, so `sleep(0)` is
+    skipped and the loop spins forever on a frozen clock — a `--duration` daemon
+    that never exits, never checkpoints its ledger, and holds the runner until
+    GitHub's own 6-hour timeout kills it.
+    """
+    import precision_tap.live as L
+    cfg = scan_cfg(live={"intraday_poll_minutes": 0, "scan_times": [],
+                         "run_on_startup": False, "heartbeat_daily_time": ""})
+    clock = loop_clock(datetime.fromisoformat("2026-09-11T09:00:00"))
+    sc = FakeScanner(cfg, clock)
+
+    iterations = [0]
+    real_due = L.LiveLoop._due
+
+    def counting_due(self, now):
+        iterations[0] += 1
+        assert iterations[0] < 10_000, "the loop is spinning on an expired budget"
+        return real_due(self, now)
+
+    monkeypatch_due = L.LiveLoop._due
+    L.LiveLoop._due = counting_due
+    try:
+        # a budget that lands exactly on the idle-sleep boundary (the spin case)
+        L.LiveLoop(cfg, sc, stop_after=clock.monotonic() + 100 * 60).run()
+        # and one that is already spent before the first iteration
+        L.LiveLoop(cfg, sc, stop_after=clock.monotonic()).run()
+    finally:
+        L.LiveLoop._due = monkeypatch_due
+    assert iterations[0] < 10_000
+
+
+def test_loop_accumulates_undelivered_alerts_across_cycles(loop_clock):
+    """One long job must still be able to fail on a delivery problem.
+
+    `scan` and `run --once` exit 4 when alerts were found but never reached
+    Telegram.  A loop covering a whole session returns from `run()` once, so the
+    per-cycle outcome has to be accumulated — otherwise a job that matched taps
+    all afternoon and delivered none exits 0 and the run looks green.
+    """
+    import precision_tap.live as L
+    from precision_tap.alerts import DispatchResult
+    from precision_tap.scanner import ScanReport
+
+    cfg = scan_cfg(live={"scan_times": ["10:00", "11:00"], "run_on_startup": True,
+                         "intraday_poll_minutes": 0, "heartbeat_daily_time": ""})
+    clock = loop_clock(datetime.fromisoformat("2026-09-11T09:00:00"))
+
+    class Undelivered(FakeScanner):
+        def scan(self, *, live, progress=False, **kw):
+            return ScanReport(mode="live" if live else "eod", notes=[],
+                              dispatch=DispatchResult(sent=0, queued=2, failed=1))
+
+    sc = Undelivered(cfg, clock)
+    stop_at = clock.now + timedelta(hours=4)
+
+    def sleep_guard(secs):
+        clock.sleep(secs)
+        if clock.now >= stop_at:
+            raise KeyboardInterrupt
+    L.time.sleep = sleep_guard
+    loop = L.LiveLoop(cfg, sc)
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+    assert loop._cycles == 3, sc.calls
+    assert loop.undelivered == 9, "queued+failed must add up over every cycle"
+
+
+def test_loop_accumulates_log_only_cycles(loop_clock):
+    """`log-only` is the other shape of "found but never sent" (no transport)."""
+    import precision_tap.live as L
+    from precision_tap.alerts import DispatchResult
+    from precision_tap.scanner import ScanReport
+
+    cfg = scan_cfg(live={"scan_times": ["10:00"], "run_on_startup": True,
+                         "intraday_poll_minutes": 0, "heartbeat_daily_time": ""})
+    clock = loop_clock(datetime.fromisoformat("2026-09-11T09:00:00"))
+
+    class LogOnly(FakeScanner):
+        def scan(self, *, live, progress=False, **kw):
+            return ScanReport(mode="eod", notes=[],
+                              dispatch=DispatchResult(skipped=2, log_only=2))
+
+    sc = LogOnly(cfg, clock)
+    stop_at = clock.now + timedelta(hours=3)
+
+    def sleep_guard(secs):
+        clock.sleep(secs)
+        if clock.now >= stop_at:
+            raise KeyboardInterrupt
+    L.time.sleep = sleep_guard
+    loop = L.LiveLoop(cfg, sc)
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+    assert loop.log_only == 4
+    assert loop.undelivered == 0
+
+
+def test_loop_counts_cycles_that_crashed(loop_clock):
+    import precision_tap.live as L
+    cfg = scan_cfg(live={"scan_times": ["10:00"], "run_on_startup": True,
+                         "intraday_poll_minutes": 0, "heartbeat_daily_time": ""})
+    clock = loop_clock(datetime.fromisoformat("2026-09-11T09:00:00"))
+
+    class Boom(FakeScanner):
+        def scan(self, *, live, progress=False, **kw):
+            raise RuntimeError("provider exploded")
+
+    sc = Boom(cfg, clock)
+    stop_at = clock.now + timedelta(hours=3)
+
+    def sleep_guard(secs):
+        clock.sleep(secs)
+        if clock.now >= stop_at:
+            raise KeyboardInterrupt
+    L.time.sleep = sleep_guard
+    loop = L.LiveLoop(cfg, sc)
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        pass
+    assert loop.failed_cycles == 2 and loop._cycles == 2
+
+
 def test_loop_ignores_malformed_schedule_entries(loop_clock):
     cfg = scan_cfg(live={"scan_times": ["oops", "25:99", "10:00"], "run_on_startup": False,
                          "intraday_poll_minutes": 0, "heartbeat_daily_time": ""})
@@ -626,3 +827,121 @@ def test_exchange_label_maps_provider_codes():
     assert exchange_label("BOM") == "BSE"
     assert exchange_label("NASDAQ") == "NASDAQ"      # unknown codes pass through
     assert exchange_label(None) == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_run — turning the loop's accumulated counters into a scheduler-visible exit
+# ─────────────────────────────────────────────────────────────────────────────
+def _stubbed_cmd_run(monkeypatch, *, run_rc=0, undelivered=0, log_only=0,
+                     failed_cycles=0, cycles=3, telegram=None, quiet_log_only=False,
+                     cli_args=None):
+    """Run :func:`precision_tap.cli.cmd_run` against a loop with fixed counters.
+
+    ``cli_args`` overrides the argparse namespace (e.g. ``{"duration": -120}``);
+    it is kept separate from the counter kwargs so a CLI flag can never collide
+    with one of them.  Returns ``(exit_code, kwargs the loop was built with)``.
+    """
+    import contextlib
+
+    import precision_tap.cli as C
+    import precision_tap.live as L
+
+    cfg = scan_cfg(telegram=telegram or TelegramConfig(enabled=False),
+                   alert={"quiet_log_only": quiet_log_only})
+    monkeypatch.setattr(C, "_cfg", lambda a: cfg)
+    monkeypatch.setattr(C, "setup_logging", lambda *a, **k: None)
+
+    @contextlib.contextmanager
+    def _store(_c):
+        yield None
+    monkeypatch.setattr(C, "_store", _store)
+    monkeypatch.setattr(C, "_scanner",
+                        lambda *a, **k: type("S", (), {"close": lambda s: None})())
+
+    built = {}
+
+    class StubLoop:
+        def __init__(self, *a, **kw):
+            built.update(kw)
+            self.undelivered = undelivered
+            self.log_only = log_only
+            self.failed_cycles = failed_cycles
+            self.cycles = cycles
+
+        def run(self):
+            return run_rc
+    monkeypatch.setattr(L, "LiveLoop", StubLoop)
+
+    ns = dict(config=None, set=[], env_file=None, verbose=False, quiet=False,
+              once=False, no_send=False, no_heartbeat=True, no_logfile=True,
+              max_cycles=0, duration=0.0)
+    ns.update(cli_args or {})
+    return C.cmd_run(types.SimpleNamespace(**ns)), built
+
+
+def test_cmd_run_exits_4_when_the_loop_found_alerts_but_delivered_none(monkeypatch):
+    """The loop covers a whole session, so a green job must still mean delivered.
+
+    ``run()`` returns once, long after the cycles that found the taps.  Without
+    the accumulated counter the exit code is 0 and Actions shows green for a
+    session that matched nine taps and sent none — the exact "runs are fine,
+    chat is silent" shape this repo has been chasing.
+    """
+    rc, _ = _stubbed_cmd_run(monkeypatch, undelivered=9)
+    assert rc == 4
+
+
+def test_cmd_run_exits_4_for_log_only_alerts_when_no_transport_exists(monkeypatch):
+    """Regression: the auto-detected "no transport" case must stay a failure.
+
+    ``cmd_scan`` and ``run --once`` exit 4 here via ``_undelivered_exit``, whose
+    ``explicit_dry`` is only true for a dry run the *caller asked for*.  Folding
+    the auto-detected ``dry`` into the loop's equivalent made this branch
+    unreachable — log-only alerts can only happen when ``dry`` is true — so
+    cron/systemd (which start with an empty environment and silently expand
+    ``${TELEGRAM_BOT_TOKEN}`` to nothing) went back to exiting 0.
+    """
+    rc, _ = _stubbed_cmd_run(monkeypatch, log_only=3, telegram=TelegramConfig(enabled=False))
+    assert rc == 4
+
+
+def test_cmd_run_forgives_a_dry_run_the_caller_asked_for(monkeypatch):
+    rc, _ = _stubbed_cmd_run(monkeypatch, log_only=3, cli_args={"no_send": True})
+    assert rc == 0
+
+
+def test_cmd_run_forgives_an_explicit_quiet_log_only_choice(monkeypatch):
+    """`alerts.quiet_log_only` is an operator decision, so it is not a failure."""
+    rc, _ = _stubbed_cmd_run(monkeypatch, log_only=3, quiet_log_only=True)
+    assert rc == 0
+
+
+def test_cmd_run_exits_1_when_every_cycle_crashed(monkeypatch):
+    rc, _ = _stubbed_cmd_run(monkeypatch, failed_cycles=3, cycles=3)
+    assert rc == 1
+
+
+def test_cmd_run_stays_green_when_only_some_cycles_crashed(monkeypatch):
+    """A recovered cycle is not a failed job — the loop is allowed to retry."""
+    rc, _ = _stubbed_cmd_run(monkeypatch, failed_cycles=1, cycles=3)
+    assert rc == 0
+
+
+def test_cmd_run_propagates_the_loop_return_code(monkeypatch):
+    rc, _ = _stubbed_cmd_run(monkeypatch, run_rc=3)
+    assert rc == 3
+
+
+def test_cmd_run_never_hands_a_negative_duration_to_the_loop(monkeypatch):
+    """``--duration 0`` means *no deadline*, so a negative budget must not leak.
+
+    The CI plan step computes ``min(window_left, job_cap)``; once the window has
+    closed that is ≤ 0.  Passed straight through it becomes "run forever" and
+    only the runner's own 6-hour timeout stops it.
+    """
+    rc, built = _stubbed_cmd_run(monkeypatch, cli_args={"duration": -120.0})
+    assert built["stop_after"] is None
+    rc, built = _stubbed_cmd_run(monkeypatch, cli_args={"duration": 0.0})
+    assert built["stop_after"] is None
+    rc, built = _stubbed_cmd_run(monkeypatch, cli_args={"duration": 90.0})
+    assert built["stop_after"] is not None
