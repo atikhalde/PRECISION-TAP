@@ -210,13 +210,17 @@ Add two repository secrets and it is live:
 | `SCAN_SYMBOLS` *(variable, optional)* | ad-hoc universe, e.g. `RELIANCE,TCS,INFY` |
 | `SCAN_EVENTS` *(variable, optional)* | e.g. `tap1` to cut the volume |
 | `SCAN_MIN_DV` *(variable, optional)* | 20d median turnover floor in ₹ crore |
+| `SCAN_RECENT_BARS` *(variable, optional)* | alert window in bars — config default `1`; `3`–`5` reviews the week after a weekend or holiday |
 
 **It does *not* rely on cron for the cadence.** Cron is used only to *kick* the job; the job then
 owns the session itself with the same always-on loop as `run` — intraday polling every
 `live.intraday_poll_minutes` plus the `live.scan_times` closed-bar prints, each cycle picking
 live-vs-closed-bar from the exchange clock. You can also start one by hand from the **Actions** tab
-(one cycle by default, or the whole session with `loop=true`), with a forced `live`/`eod` mode and a
-dry-run toggle.
+(one cycle by default, or the whole session with `loop=true`), with a forced `live`/`eod` mode, a
+dry-run toggle, and `recent_bars` to widen the alert window — the way to ask *"what did I miss this
+week?"* after a weekend or a holiday, since a default one-bar cycle can only re-read the last
+completed session. The ledger still dedupes whatever an earlier cycle delivered, so a wider window
+re-reports, it does not re-send.
 
 Why the change matters: this workflow used to declare 29 cron slots a day, one every 15 minutes
 across the session. Measured on its first trading day, **15 slots were due, 5 fired, every one of
@@ -319,7 +323,7 @@ cycle against the live market and prints `RESULT: PASS` or names the first thing
 |---|---|
 | `Telegram not configured` | `.env` needs `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; check `python -m precision_tap telegram-test` |
 | Token set, chat silent, runs are green | `getMe` passing only proves the *token* — validate the chat too: `python -m precision_tap telegram-test --validate-only` (no message sent). A wrong chat id / un-started bot fails here instead of eating alerts |
-| Two green runs, no alert — and it is a weekend or holiday | **Expected, and now labelled.** `alerts.recent_bars: 1` means a cycle evaluates exactly **one bar**, and on a non-trading day that bar is the *previous* session — so two runs are not two chances, they are the same bar read twice. The cycle names the bar it looked at: `MARKET CLOSED` (Sat/Sun, or a day outside `live.trading_days`), `NO FRESH SESSION` (a trading day, but the EOD print has not settled yet, or you forced `--eod` mid-session), `FEED BEHIND` (the newest bar is older than the session the feed should already have — an NSE holiday, or a lagging provider). The GitHub step summary prints **session evaluated** on the run page, and a non-trading day is annotated with a `::warning::` so it is visible without opening the log. On a weekend the digest is posted by *any* job (there is no later slot to protect) and reports that session's alerts. To scan more than one bar: `alerts.recent_bars: 2-3` |
+| Two green runs, no alert — and it is a weekend or holiday | **Expected, and now labelled.** `alerts.recent_bars: 1` means a cycle evaluates exactly **one bar**, and on a non-trading day that bar is the *previous* session — so two runs are not two chances, they are the same bar read twice. The cycle names the bar it looked at: `MARKET CLOSED` (Sat/Sun, or a day outside `live.trading_days`), `NO FRESH SESSION` (a trading day, but the EOD print has not settled yet, or you forced `--eod` mid-session), `FEED BEHIND` (the newest bar is older than the session the feed should already have — an NSE holiday, or a lagging provider). The GitHub step summary prints **session evaluated** on the run page, and a non-trading day is annotated with a `::warning::` so it is visible without opening the log. On a weekend the digest is posted by *any* job (there is no later slot to protect) and reports that session's alerts. To scan more than one bar: `alerts.recent_bars: 2-3`, or the `recent_bars` input on a dispatched run (`SCAN_RECENT_BARS` to make it the default) |
 | `SCAN FAILED … exit 2` | the universe resolved to **0 symbols** — a preset (`nifty500`, `allnse`…) whose every download source failed, or an empty/commented file. nseindia archives reject datacenter IPs (GitHub runners included); the presets fall back to Wikipedia tables automatically, but if all sources fail, point `data.universe_file` at a local file (`universe/nse.txt`) |
 | `SCAN FAILED … exit 3` | the feed failed outright (`usable=0`, mostly errors) — provider outage or misconfiguration. A holiday-shaped cycle (fetches ok, no fresh bar) stays green by design |
 | `SCAN FAILED … exit 4` | signals were found but **not** delivered. Two shapes: `DELIVERY PROBLEM` — Telegram rejected the send (usually a 400/403 chat problem); or `NOT SENT … log-only=N` — there was no transport to send with (`telegram.enabled: false`, or the token/chat never reached the process). Fix it and the alerts are re-offered next cycle — a queued row is never held against you by a transport that cannot drain it |

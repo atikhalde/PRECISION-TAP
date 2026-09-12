@@ -172,3 +172,19 @@ def test_the_scan_step_still_owns_the_cadence(steps):
     assert "steps.plan.outputs.budget" in run
     # …and a cycle that found signals but delivered none must still fail the job
     assert "exit \"$rc\"" in run
+
+
+def test_a_dispatch_can_widen_the_alert_window(steps):
+    """A one-bar cycle on a weekend can only re-read the last completed session,
+    so the run page has to offer a wider window — otherwise the `MARKET CLOSED`
+    note's advice to use `--recent-bars 5` is advice a hosted user cannot follow.
+    """
+    doc = yaml.safe_load(WF.read_text(encoding="utf-8"))
+    on = doc.get("on", doc.get(True))                    # YAML 1.1 parses `on:` as True
+    inputs = on["workflow_dispatch"]["inputs"]
+    assert "recent_bars" in inputs, sorted(inputs)
+    run = _step(steps, "Run live scanner (yfinance → Telegram)")["run"]
+    assert "--recent-bars" in run
+    assert "SCAN_RECENT_BARS" in run and "inputs.recent_bars" in run
+    # 0 must mean "leave the config alone", not "alert on zero bars"
+    assert '"$RECENT" != "0"' in run

@@ -11,6 +11,8 @@
 #   vars.SCAN_EVENTS     (opt)   e.g. "tap1" or "tap1,approach,confirmed"
 #   vars.SCAN_MIN_DV     (opt)   20d median turnover floor, ₹ crore
 #   vars.SCAN_UNIVERSE   (opt)   nifty50|nifty100|nifty200|nifty500|allnse|file
+#   vars.SCAN_RECENT_BARS (opt)  alert window in bars (config default 1;
+#                                3-5 reviews the week after a weekend/holiday)
 #
 # ── WHY THIS IS NOT "cron EVERY 15 MINUTES" ──────────────────────────────────
 # It used to be, and that is why the scanner looked healthy while the chat stayed
@@ -94,6 +96,10 @@ on:
         description: "Run the whole session loop instead of a single cycle"
         type: boolean
         default: false
+      recent_bars:
+        description: "Alert window in bars (0 = config default; 3-5 reviews the week)"
+        required: false
+        default: "0"
       dry_run:
         description: "Dry run — compute and log, never send to Telegram"
         type: boolean
@@ -284,6 +290,15 @@ jobs:
           fi
           if [ -n "${{ vars.SCAN_EVENTS }}" ]; then
             SETS+=(--events "${{ vars.SCAN_EVENTS }}")
+          fi
+          # `alerts.recent_bars: 1` means a cycle evaluates exactly one bar, so a
+          # weekend/holiday dispatch can only re-read the last completed session.
+          # Widening the window is how you ask "what did I miss this week?" from
+          # the Actions tab — the ledger still dedupes whatever an earlier cycle
+          # already delivered, so it re-reports, never re-sends.
+          RECENT="${{ vars.SCAN_RECENT_BARS || inputs.recent_bars || '0' }}"
+          if [ -n "$RECENT" ] && [ "$RECENT" != "0" ]; then
+            SETS+=(--recent-bars "$RECENT")
           fi
           # universe override: nifty50 | nifty100 | nifty200 | nifty500 |
           # allnse (whole exchange) | a repo file path, e.g. universe/nse.txt
