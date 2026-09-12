@@ -11,14 +11,49 @@
 #   vars.SCAN_EVENTS     (opt)   e.g. "tap1" or "tap1,approach,confirmed"
 #   vars.SCAN_MIN_DV     (opt)   20d median turnover floor, ₹ crore
 #   vars.SCAN_UNIVERSE   (opt)   nifty50|nifty100|nifty200|nifty500|allnse|file
-#                                (nseindia archives reject datacenter IPs — the
-#                                preset falls back to Wikipedia tables; a repo
-#                                file like universe/nse.txt always works)
 #
-# Schedules are UTC (GitHub cron is always UTC).  NSE 09:15–15:30 IST is
-# 03:45–10:00 UTC.  The scanner picks intraday-vs-closed-bar mode from the
-# exchange clock itself — `_market_open` resolves ZoneInfo(live.market_timezone),
-# so a UTC runner behaves exactly like an Asia/Kolkata host.
+# ── WHY THIS IS NOT "cron EVERY 15 MINUTES" ──────────────────────────────────
+# It used to be, and that is why the scanner looked healthy while the chat stayed
+# empty.  GitHub's `schedule` trigger is explicitly best-effort: runs are delayed
+# during high load and *dropped* when it stays high, and low-traffic repos are
+# deprioritised in the queue.  Measured on this repository (Fri 2026-09-11, the
+# only trading day the schedule had existed for): 15 slots were due after the
+# workflow was registered, 5 fired, every one of them 1–4 hours late, and **not
+# one landed inside the NSE session**.  All 5 ran after the close in closed-bar
+# mode, so the entire intraday tap stream — the product — never executed, while
+# every run reported success.
+#
+# So cron is used only as a *kick*, and the job owns the cadence itself: one
+# long-lived `precision_tap run` loop polls every `live.intraday_poll_minutes`
+# and fires at `live.scan_times`, picking live-vs-closed-bar from the exchange
+# clock.  Missing a kick now costs coverage, not the whole day, and the kicks are
+# staggered so the coverage degrades instead of collapsing:
+#
+#   09:05 IST kick → runs to the 5h30 job cap, covering the open + morning
+#   11:25 IST kick → covers the afternoon, the close and the digest
+#   13:05 IST kick → covers the close and the digest even if it is the only one
+#   14:55 IST kick → covers the close
+#   15:25 IST kick → covers the 15:35 / 16:10 closed-bar prints and the digest
+#   16:15 IST kick → one settled-EOD cycle (still catches the day's closed bar)
+#
+# Each job runs until SESSION_WINDOW_END_IST (17:20) or JOB_CAP_MINUTES,
+# whichever comes first, so the kicks hand over to one another instead of
+# leaving gaps.  Any ONE of the last four kicks reaching the runner is enough to
+# cover the close and post the digest on its own; only the morning needs the
+# 09:05 kick.  Residual gap, stated plainly: if the 09:05 kick is the ONLY one
+# GitHub runs, its 5h30 cap ends at 14:35 IST and that day's post-close prints
+# are missed — the morning is still covered, and the next day self-corrects.
+# If all five are dropped GitHub never ran anything at all — which is why
+# deploy/README.md documents the self-hosted cron/systemd path for anyone who
+# needs a guarantee rather than five independent chances.
+#
+# A kick that arrives while another job holds the concurrency group simply
+# queues; when it finally starts, the budget step sees the window has closed and
+# degrades to a single catch-up cycle, so redundant kicks cost ~1 minute each and
+# the de-duplication ledger makes them idempotent.
+#
+# Minutes are free on public repos, but the 6-hour per-job cap is not: each job
+# therefore runs at most JOB_CAP_MINUTES and hands over to the next kick.
 #
 # ⚠ Dedupe lives in data/state.sqlite3.  Runners are ephemeral, so that file is
 #   carried between runs with actions/cache.  Without it every cycle would
@@ -28,14 +63,17 @@ name: Live scanner
 
 on:
   schedule:
-    # ── intraday: every 15 min across the NSE session (09:15–15:30 IST) ──
-    - cron: "45 3 * * 1-5"      # 09:15 IST  session open
-    - cron: "*/15 4-9 * * 1-5"  # 09:30–15:15 IST
-    - cron: "0 10 * * 1-5"      # 15:30 IST  session close
-    # ── post-close: closed-bar prints (indicator-exact) ──
-    - cron: "5 10 * * 1-5"      # 15:35 IST  closing print
-    - cron: "40 10 * * 1-5"     # 16:10 IST  settled EOD bar
-    - cron: "30 11 * * 1-5"     # 17:00 IST  settled + end-of-day digest
+    # UTC.  NSE 09:15–15:30 IST is 03:45–10:00 UTC.  Minutes are deliberately
+    # off the top-of-hour: GitHub documents the start of every hour as a
+    # high-load moment where scheduled runs are most likely to be delayed or
+    # dropped, and four kicks at :00/:15/:30/:45 of the same hour is how a whole
+    # day goes missing at once.
+    - cron: "35 3 * * 1-5"      # 09:05 IST — pre-open kick, covers the morning
+    - cron: "55 5 * * 1-5"      # 11:25 IST — mid-session kick
+    - cron: "35 7 * * 1-5"      # 13:05 IST — afternoon kick, reaches the close on its own
+    - cron: "25 9 * * 1-5"      # 14:55 IST — late-session kick, covers the close
+    - cron: "55 9 * * 1-5"      # 15:25 IST — closing-auction kick (15:35 + 16:10 prints)
+    - cron: "45 10 * * 1-5"     # 16:15 IST — post-close kick, settled EOD bar
 
   workflow_dispatch:
     inputs:
@@ -52,6 +90,10 @@ on:
         description: "Cap universe to first N symbols (0 = all)"
         required: false
         default: "0"
+      loop:
+        description: "Run the whole session loop instead of a single cycle"
+        type: boolean
+        default: false
       dry_run:
         description: "Dry run — compute and log, never send to Telegram"
         type: boolean
@@ -59,7 +101,8 @@ on:
 
 # Every run shares one SQLite ledger.  Serialise them so two cycles can never
 # race on the cache.  cancel-in-progress:false keeps a queued cycle rather than
-# dropping it — a dropped intraday cycle is a missed tap.
+# dropping it — and a queued kick self-limits to one catch-up cycle once the
+# session window has closed, so the queue cannot pile up runner hours.
 concurrency:
   group: precision-tap-live-scan
   cancel-in-progress: false
@@ -72,15 +115,20 @@ env:
   PYTHONUNBUFFERED: "1"
   TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
   TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+  # End of the covered window, in exchange time: the last `live.scan_times` entry
+  # is 16:10 IST and the digest posts around 17:00, so 17:20 leaves room for both.
+  SESSION_WINDOW_END_IST: "17:20"
+  # Per-job cap, kept clear of GitHub's hard 6-hour limit so the artefact and
+  # ledger-cache steps still get to run.
+  JOB_CAP_MINUTES: "330"
 
 jobs:
   live-scan:
     name: Live market scan → Telegram
     runs-on: ubuntu-latest
-    # A full-market universe (nifty500 ≈ 500 fetches, nse_all ≈ 2 000+) at the
-    # configured rate limit needs far more than a quick job — 20 min cut live
-    # cycles off mid-universe.
-    timeout-minutes: 45
+    # A session-covering loop needs the whole session; 360 is GitHub's cap and
+    # JOB_CAP_MINUTES keeps the loop itself inside it.
+    timeout-minutes: 360
 
     steps:
       - name: Check out repository
@@ -152,92 +200,130 @@ jobs:
           echo "Telegram token and chat id present"
 
       # getMe authenticates the token and getChat validates every chat id — all
-      # without sending anything (a "starting" ping here would mean ~29 messages
-      # a day of pure noise).  getMe alone is NOT enough: a mistyped chat id, a
-      # bot that was never started, or a bot missing from the group all pass
+      # without sending anything.  getMe alone is NOT enough: a mistyped chat id,
+      # a bot that was never started, or a bot missing from the group all pass
       # getMe and then eat every alert at send time while the run stays green.
       - name: Verify bot token + chat id (no message sent)
         if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         run: |
           python -m precision_tap telegram-test --validate-only
 
+      # ── how much of the session is left? ────────────────────────────────────
+      # Decides loop-vs-single-cycle *at job start*, not at kick time: a kick
+      # that queued behind another job can start hours late, and by then the
+      # window is closed and a full loop would be pointless.
+      - name: Plan this job (session budget)
+        id: plan
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import datetime, os
+          from zoneinfo import ZoneInfo
+
+          tz = ZoneInfo("Asia/Kolkata")
+          now = datetime.datetime.now(tz)
+          hh, mm = (int(x) for x in os.environ["SESSION_WINDOW_END_IST"].split(":"))
+          end = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+          cap = int(os.environ["JOB_CAP_MINUTES"]) * 60
+          budget = int(min((end - now).total_seconds(), cap))
+
+          # A schedule kick owns the session; a manual dispatch means "one cycle
+          # now" unless its `loop` input says otherwise.  Below ~2 minutes of
+          # budget there is no session left to cover, so degrade to a single
+          # catch-up cycle — which still reads today's settled bar.
+          loop_input = "${{ inputs.loop }}" == "true"
+          scheduled = "${{ github.event_name }}" == "schedule"
+          plan = "loop" if (budget >= 120 and (loop_input or scheduled)) else "once"
+
+          print(f"plan={plan}")
+          print(f"budget={max(budget, 0)}")
+          print(f"ist_now={now:%Y-%m-%d %H:%M %a}")
+          print(f"window_end={end:%H:%M} IST")
+          PY
+          echo "::notice::plan=${{ steps.plan.outputs.plan }} · now ${{ steps.plan.outputs.ist_now }} IST · window closes ${{ steps.plan.outputs.window_end }} IST · budget ${{ steps.plan.outputs.budget }}s"
+
       # ── the scan ────────────────────────────────────────────────────────────
-      # No --live/--eod: `scan` asks _market_open and rebuilds today's bar from
-      # 5m ticks during the session, settled bars after it.  --retried drains
-      # whatever a previous cycle queued behind a Telegram outage.
-      # Exit codes: 0 ok (a quiet market is ok), 3 nothing usable (feed dead),
-      # 4 signals found but not delivered (Telegram broken) — the last two fail
-      # the job so a broken pipeline can never look like a quiet market again.
-      # 4 now covers both shapes of "found but never delivered": a rejection at
-      # send time, and a cycle with nothing to send with at all (`log-only=N` —
-      # e.g. the secret never reached the process), which used to exit 0.
-      - name: Run live scan (yfinance → Telegram)
+      # Exit codes: 0 ok (a quiet market is ok), 1 every cycle crashed,
+      # 2 empty universe, 3 nothing usable (feed dead), 4 signals found but not
+      # delivered (Telegram broken).  The loop accumulates 4 across all its
+      # cycles, so a session that matched taps and delivered none is red.
+      - name: Run live scanner (yfinance → Telegram)
         id: scan
         run: |
-          ARGS=(scan --retried --top 40)
+          BASE=(--retried)
+          SETS=()
 
-          case "${{ inputs.mode || 'auto' }}" in
-            live) ARGS+=(--live) ;;
-            eod)  ARGS+=(--eod)  ;;
-          esac
-
-          if [ "${{ inputs.dry_run }}" = "true" ]; then
-            ARGS+=(--no-send)
-          fi
-
-          LIMIT="${{ vars.SCAN_LIMIT || inputs.limit || '0' }}"
-          if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then
-            ARGS+=(--limit "$LIMIT")
-          fi
-
+          MODE="${{ inputs.mode || 'auto' }}"
           SYMS="${{ vars.SCAN_SYMBOLS || inputs.symbols }}"
           if [ -n "$SYMS" ]; then
             # shellcheck disable=SC2206
             ARR=(${SYMS//,/ })
-            ARGS+=(-S "${ARR[@]}")
+            SETS+=(-S "${ARR[@]}")
           fi
-
+          LIMIT="${{ vars.SCAN_LIMIT || inputs.limit || '0' }}"
+          if [ -n "$LIMIT" ] && [ "$LIMIT" != "0" ]; then
+            SETS+=(--limit "$LIMIT")
+          fi
           if [ -n "${{ vars.SCAN_EVENTS }}" ]; then
-            ARGS+=(--events "${{ vars.SCAN_EVENTS }}")
+            SETS+=(--events "${{ vars.SCAN_EVENTS }}")
           fi
           # universe override: nifty50 | nifty100 | nifty200 | nifty500 |
           # allnse (whole exchange) | a repo file path, e.g. universe/nse.txt
           if [ -n "${{ vars.SCAN_UNIVERSE }}" ]; then
-            ARGS+=(--set "data.universe_file=${{ vars.SCAN_UNIVERSE }}")
+            SETS+=(--set "data.universe_file=${{ vars.SCAN_UNIVERSE }}")
           fi
           if [ -n "${{ vars.SCAN_MIN_DV }}" ]; then
-            ARGS+=(--min-dollar-volume "${{ vars.SCAN_MIN_DV }}")
+            SETS+=(--min-dollar-volume "${{ vars.SCAN_MIN_DV }}")
+          fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            SETS+=(--no-send)
           fi
 
-          echo "::group::python -m precision_tap ${ARGS[*]}"
           set +e
-          python -m precision_tap "${ARGS[@]}" 2>&1 | tee scan-output.txt
-          rc=${PIPESTATUS[0]}
+          if [ "${{ steps.plan.outputs.plan }}" = "loop" ]; then
+            # One process owns the cadence: intraday polling + live.scan_times,
+            # live-vs-closed-bar chosen from the exchange clock per cycle.
+            echo "::group::python -m precision_tap run --duration ${{ steps.plan.outputs.budget }}"
+            python -m precision_tap run --duration "${{ steps.plan.outputs.budget }}" \
+              "${SETS[@]}" 2>&1 | tee -a scan-output.txt
+            rc=${PIPESTATUS[0]}
+            echo "::endgroup::"
+          else
+            ARGS=(scan "${BASE[@]}" --top 40)
+            case "$MODE" in
+              live) ARGS+=(--live) ;;
+              eod)  ARGS+=(--eod)  ;;
+            esac
+            echo "::group::python -m precision_tap ${ARGS[*]} ${SETS[*]}"
+            python -m precision_tap "${ARGS[@]}" "${SETS[@]}" 2>&1 | tee -a scan-output.txt
+            rc=${PIPESTATUS[0]}
+            echo "::endgroup::"
+          fi
           set -e
-          echo "::endgroup::"
           exit "$rc"
 
-      # ── what just happened, in one glance ────────────────────────────────────
-      # The run's green/red already reflects pipeline health (the scan step fails
-      # on feed-dead and on undelivered alerts), but "success + silence" still
-      # needs one line saying *why*: quiet market, or filtered everything.
+      # ── what just happened, in one glance ───────────────────────────────────
       - name: Summarise scan result
         if: always()
         run: |
           python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import glob, json, os
-          files = sorted(glob.glob("results/scan_*.json"))
+          files = glob.glob("results/scan_*.json")
           if not files:
               print("## Precision Tap — no scan report produced")
               print("The scan step never wrote `results/scan_*.json` — read the step log above.")
               raise SystemExit
+          # A session loop writes one report per cycle; sort by mtime, not by
+          # name — `scan_eod_*` sorts before `scan_live_*` alphabetically, so
+          # name order would summarise a morning EOD cycle instead of the last one.
+          files.sort(key=os.path.getmtime)
           rep = json.load(open(files[-1]))
           n_alerts = len(rep.get("alerts", []))
           kinds = {}
           for a in rep.get("alerts", []):
               kinds[a["event"]] = kinds.get(a["event"], 0) + 1
           acc = " · ".join(f"{k} {v}" for k, v in sorted(kinds.items())) or "—"
-          print(f"## Precision Tap — {rep.get('mode', '?')} scan")
+          print(f"## Precision Tap — {rep.get('mode', '?')} scan "
+                f"(latest of {len(files)} cycle report(s))")
           print(f"**universe** {rep.get('universe')} · **usable** {rep.get('usable')} · "
                 f"**errors** {rep.get('errors')} · **with zones** {rep.get('symbols_with_zones')}")
           print(f"**events in window** {rep.get('events_in_window')} · "
@@ -245,7 +331,7 @@ jobs:
           print(f"**alerts** {n_alerts} ({acc}) · **delivery** `{rep.get('delivery') or '—'}`")
           show = [n for n in rep.get("notes", []) if n.startswith(
               ("FEED PROBLEM", "DELIVERY PROBLEM", "NOT SENT", "no usable symbols",
-               "nothing to send", "also filtered"))]
+               "UNIVERSE EMPTY", "nothing to send", "also filtered"))]
           for n in show[:6]:
               print(f"- {n}")
           if n_alerts:
@@ -256,27 +342,55 @@ jobs:
           PY
 
       # ── end-of-day digest ───────────────────────────────────────────────────
-      # "Silence ≠ no signals": the 17:00 IST cycle posts what happened, so a
-      # quiet day is visibly different from a dead pipeline.  Keyed on the cron
-      # string, which is exact — no clock arithmetic to drift.
+      # "Silence ≠ no signals": after the EOD bar settles, post what happened so
+      # a quiet day is visibly different from a dead pipeline.  Runs at the end
+      # of *any* job (not just one cron slot — a dropped kick must not cost the
+      # digest) and is idempotent through the ledger, so the four staggered kicks
+      # cannot post it four times.
       - name: Post end-of-day digest
-        if: ${{ always() && steps.scan.outcome == 'success' && github.event_name == 'schedule' && github.event.schedule == '30 11 * * 1-5' }}
+        if: ${{ always() && steps.scan.outcome == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         run: |
           python - <<'PY' > digest.txt
-          import sqlite3, datetime
-          c = sqlite3.connect("data/state.sqlite3")
-          c.row_factory = sqlite3.Row
+          import datetime, sqlite3, sys
+          from zoneinfo import ZoneInfo
+
+          now = datetime.datetime.now(ZoneInfo("Asia/Kolkata"))
+          # Before the settled-EOD scan at 16:10 IST the day is not over yet.
+          # Exiting 0 with an empty file is the signal to post nothing — a
+          # non-zero exit here would fail the job (and fire the Telegram failure
+          # notice) on every morning kick, which is a perfectly normal outcome.
+          if (now.hour, now.minute) < (16, 40):
+              sys.stderr.write("digest skipped: too early in the session\n")
+              raise SystemExit(0)
+
+          ledger = sqlite3.connect("data/state.sqlite3")
+          ledger.row_factory = sqlite3.Row
+          key = f"__digest__|{now.date().isoformat()}"
+          st = None
+          try:
+              from precision_tap.state import StateStore
+              st = StateStore("data/state.sqlite3")
+              if not st.record_alert(key, symbol="__digest__", event="digest"):
+                  sys.stderr.write("digest already posted today\n")
+                  raise SystemExit(0)
+              st.mark(key, sent=True)     # never let retry_pending resend it
+          except SystemExit:
+              raise
+          except Exception as exc:        # a broken ledger must not eat the digest
+              sys.stderr.write(f"ledger guard unavailable ({exc})\n")
+
           today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-          rows = c.execute(
+          rows = ledger.execute(
               "SELECT symbol, event, sent FROM alerts "
-              "WHERE substr(created_at,1,10) = ? ORDER BY created_at", (today,)).fetchall()
-          run = c.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+              "WHERE substr(created_at,1,10) = ? AND symbol != '__digest__' "
+              "ORDER BY created_at", (today,)).fetchall()
+          run = ledger.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
           kinds = {}
           for r in rows:
               kinds[r["event"]] = kinds.get(r["event"], 0) + 1
           sent = sum(1 for r in rows if r["sent"] == 1)
           queued = sum(1 for r in rows if r["sent"] == 0)
-          out = [f"\U0001F5D3 <b>Precision Tap · end of day {today}</b>"]
+          out = [f"\U0001F5D3 <b>Precision Tap · end of day {now.date().isoformat()}</b>"]
           if rows:
               acc = " · ".join(f"{k} {v}" for k, v in sorted(kinds.items()))
               out.append(f"{len(rows)} alert(s): {acc}")
@@ -293,7 +407,11 @@ jobs:
                          f"usable {run['usable']} · errors {run['errors']}</i>")
           print("\n".join(out))
           PY
-          python -m precision_tap telegram-test --text "$(cat digest.txt)"
+          if [ -s digest.txt ]; then
+            python -m precision_tap telegram-test --text "$(cat digest.txt)"
+          else
+            echo "no digest to post"
+          fi
 
       # ── persist the ledger ──────────────────────────────────────────────────
       # WAL sidecar files would be lost with the runner, so fold them back into
@@ -343,5 +461,5 @@ jobs:
         continue-on-error: true
         run: |
           python -m precision_tap telegram-test --text "⚠️ <b>Precision Tap live scan failed</b>
-          run <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">#${{ github.run_number }}</a> · ${{ github.event_name }}
+          run <a href=\"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\">#${{ github.run_number }}</a> · ${{ github.event_name }} · plan ${{ steps.plan.outputs.plan }}
           check the workflow log for the traceback."

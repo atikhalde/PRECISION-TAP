@@ -65,6 +65,14 @@ class LiveLoop:
     max_cycles: int = 0                 # 0 = forever (handy for tests/CI)
     on_scan: Optional[Callable[[Any], None]] = None
     stop_after: Optional[float] = None  # monotonic deadline (tests)
+    #: alerts found by some cycle that never reached Telegram.  A long-lived
+    #: loop covers a whole session in one process, so it cannot report failure
+    #: per cycle the way `scan` does — without these counters a job that matched
+    #: nine taps and delivered none would still exit 0 and look healthy, which
+    #: is exactly the "green run, silent chat" the one-shot path already fails on.
+    undelivered: int = 0
+    log_only: int = 0
+    failed_cycles: int = 0
     _stop: bool = field(default=False, repr=False)
     _last_poll: Optional[float] = field(default=None, repr=False)
     _fired: Dict[str, str] = field(default_factory=dict, repr=False)
@@ -116,6 +124,11 @@ class LiveLoop:
         if self._last_poll is None:
             return True
         return time.monotonic() - self._last_poll >= max(0.0, float(minutes) * 60.0)
+
+    @property
+    def cycles(self) -> int:
+        """Scan cycles completed so far — what the CLI reports against."""
+        return self._cycles
 
     def _sleep_seconds(self, now: datetime) -> float:
         live = self.cfg.live
@@ -192,7 +205,25 @@ class LiveLoop:
                 self._send_heartbeat(now)
             elif tag:
                 self._scan(tag)
-            time.sleep(self._sleep_seconds(_local_now(live.market_timezone)))
+            nap = self._sleep_seconds(_local_now(live.market_timezone))
+            if self.stop_after is not None:
+                # `_sleep_seconds` is capped at an hour, so an unbounded sleep
+                # would blow straight past the deadline — a CI job asked to cover
+                # a session segment would overrun by up to 60 minutes and eat the
+                # runner's own timeout.  Never sleep past the stop point.
+                #
+                # And once the budget is spent, *break*: capping the sleep to 0
+                # and skipping it leaves the loop spinning on a frozen clock
+                # (nothing advances `monotonic` any more), which pegs a core
+                # forever and means a `--duration` daemon never exits, never
+                # checkpoints its ledger and never lets the job finish.
+                remaining = self.stop_after - time.monotonic()
+                if remaining <= 0:
+                    log.info("stop_after deadline reached")
+                    break
+                nap = min(nap, remaining)
+            if nap > 0:
+                time.sleep(nap)
         log.info("live loop stopped after %d cycle(s)", self._cycles)
         return 0
 
@@ -216,6 +247,7 @@ class LiveLoop:
         try:
             rep = self.scanner.scan(live=(mode == "live"), progress=False)
         except Exception as exc:                        # never die on a bad cycle
+            self.failed_cycles += 1
             log.exception("scan cycle failed: %s", exc)
             if self.store is not None:
                 try:
@@ -234,6 +266,8 @@ class LiveLoop:
         # is silent" stays invisible for a whole session.
         d = rep.dispatch
         if d is not None and not isinstance(d, dict):
+            self.undelivered += int(getattr(d, "undelivered", 0) or 0)
+            self.log_only += int(getattr(d, "log_only", 0) or 0)
             log.info("cycle %s → delivery %s", tag, d)
             if getattr(d, "undelivered", 0):
                 log.error("cycle %s: %d alert(s) did NOT reach Telegram — %s",

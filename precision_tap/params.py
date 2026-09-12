@@ -267,6 +267,7 @@ class AlertConfig:
     min_price: float = 0.0
     max_price: float = 0.0
     max_age_bars: int = 0                      # ignore zones older than N bars (0 = off)
+    skip_dead_on_arrival: bool = True          # no buy alert for a level its own bar already broke
     skip_stale_bars: bool = True               # no intraday alert unless the last bar is today's session
     match_indicator_100: bool = True           # EOD scans evaluate closed bars only (== TV "Once Per Bar Close")
     once_per_symbol_per_day: bool = True
