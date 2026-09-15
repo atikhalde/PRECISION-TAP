@@ -93,9 +93,9 @@ on:
         required: false
         default: "0"
       loop:
-        description: "Run the whole session loop instead of a single cycle"
+        description: "Cover the rest of the session (default). Uncheck for one cycle only."
         type: boolean
-        default: false
+        default: true
       recent_bars:
         description: "Alert window in bars (0 = config default; 3-5 reviews the week)"
         required: false
@@ -232,24 +232,34 @@ jobs:
           cap = int(os.environ["JOB_CAP_MINUTES"]) * 60
           budget = int(min((end - now).total_seconds(), cap))
 
-          # A schedule kick owns the session; a manual dispatch means "one cycle
-          # now" unless its `loop` input says otherwise.  Below ~2 minutes of
-          # budget there is no session left to cover, so degrade to a single
-          # catch-up cycle — which still reads today's settled bar.
-          loop_input = "${{ inputs.loop }}" == "true"
-          scheduled = "${{ github.event_name }}" == "schedule"
-          plan = "loop" if (budget >= 120 and (loop_input or scheduled)) else "once"
-
+          # A schedule kick owns the session; a manual dispatch now covers the
+          # rest of it by default too (its `loop` input defaults to true) — one
+          # click buys the session the same coverage a kick would, which matters
+          # because GitHub drops or delays most kicks (measured 2026-09-11..15:
+          # every scheduled kick landed 5+ hours late or not at all).  Uncheck
+          # `loop` for a single cycle.  Below ~2 minutes of budget there is no
+          # session left to cover, so degrade to a single catch-up cycle — which
+          # still reads today's settled bar.
           # The scanner's own calendar is `live.trading_days`; this is the same
           # weekday test, so the run page can say "there is no session today"
           # without anyone opening the log.  NSE holidays are not knowable here
           # — the scan step reports those from the feed itself (FEED BEHIND).
           trading_day = now.weekday() < 5
 
+          loop_input = "${{ inputs.loop }}" == "true"
+          scheduled = "${{ github.event_name }}" == "schedule"
+          # A weekend dispatch looping would only re-read the last closed
+          # session for up to the whole job cap — idempotent via the ledger, but
+          # 5h30 of runner time for nothing, so a dispatch loops only on a
+          # trading day (one catch-up cycle otherwise).  Scheduled kicks are
+          # weekday-only by cron, so their behaviour is unchanged; a holiday
+          # kick still loops and posts the digest naming the last session.
+          plan = "loop" if (budget >= 120 and trading_day and (loop_input or scheduled)) else "once"
+
           print(f"plan={plan}")
           print(f"budget={max(budget, 0)}")
           print(f"ist_now={now:%Y-%m-%d %H:%M %a}")
-          print(f"window_end={end:%H:%M} IST")
+          print(f"window_end={end:%H:%M}")
           print(f"trading_day={'true' if trading_day else 'false'}")
           PY
 
