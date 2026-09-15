@@ -278,8 +278,9 @@ class LiveLoop:
         else:
             log.info("cycle %s → nothing to send", tag)
         for note in rep.notes:
-            if note.startswith(("DELIVERY PROBLEM", "NOT SENT", "FEED PROBLEM",
-                                "no usable symbols", "nothing to send")):
+            if note.startswith(("DELIVERY PROBLEM", "NOT SENT", "FEED PROBLEM", "FEED BEHIND",
+                                "MARKET CLOSED", "NO FRESH SESSION", "no usable symbols",
+                                "nothing to send")):
                 log.warning("cycle %s: %s", tag, note)
         if self.on_scan is not None:
             try:

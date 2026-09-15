@@ -210,13 +210,17 @@ Add two repository secrets and it is live:
 | `SCAN_SYMBOLS` *(variable, optional)* | ad-hoc universe, e.g. `RELIANCE,TCS,INFY` |
 | `SCAN_EVENTS` *(variable, optional)* | e.g. `tap1` to cut the volume |
 | `SCAN_MIN_DV` *(variable, optional)* | 20d median turnover floor in ₹ crore |
+| `SCAN_RECENT_BARS` *(variable, optional)* | alert window in bars — config default `1`; `3`–`5` reviews the week after a weekend or holiday |
 
 **It does *not* rely on cron for the cadence.** Cron is used only to *kick* the job; the job then
 owns the session itself with the same always-on loop as `run` — intraday polling every
 `live.intraday_poll_minutes` plus the `live.scan_times` closed-bar prints, each cycle picking
 live-vs-closed-bar from the exchange clock. You can also start one by hand from the **Actions** tab
-(one cycle by default, or the whole session with `loop=true`), with a forced `live`/`eod` mode and a
-dry-run toggle.
+(one cycle by default, or the whole session with `loop=true`), with a forced `live`/`eod` mode, a
+dry-run toggle, and `recent_bars` to widen the alert window — the way to ask *"what did I miss this
+week?"* after a weekend or a holiday, since a default one-bar cycle can only re-read the last
+completed session. The ledger still dedupes whatever an earlier cycle delivered, so a wider window
+re-reports, it does not re-send.
 
 Why the change matters: this workflow used to declare 29 cron slots a day, one every 15 minutes
 across the session. Measured on its first trading day, **15 slots were due, 5 fired, every one of
@@ -255,6 +259,10 @@ Three things to know before you rely on it:
 
 A failing run posts to Telegram, and the first job to finish after 16:40 IST posts an end-of-day
 digest (idempotent through the ledger) so a quiet market is visibly different from a dead pipeline.
+On a **non-trading day** any job posts it rather than waiting for 16:40 — there is no later slot to
+protect, and a manual weekend dispatch is exactly when the chat is silent *and* unexplained. The
+digest names the session it evaluated and counts that session's alerts by `bar_date`, so a Saturday
+run answers "did Friday produce anything, and was it delivered?" instead of "no signals fired today".
 
 
 ## 7. Backtesting
@@ -296,7 +304,10 @@ tests/          ← pytest: parity wrappers, yfinance adapter (fake), Telegram (
   pine_reference.py    ← a second, literal transcription of INDICATOR.txt (independent of
                          engine.py/series.py) — the diff *is* the parity proof
   test_pine_reference.py ← fuzzes engine ↔ transcription over 16 parameter sets × 5 markets
-  test_alert_delivery.py ← "ran fine, chat silent" regressions (ledger, 4xx, quiet-cycle notes)
+  test_alert_delivery.py ← "ran fine, chat silent" regressions (ledger, 4xx, quiet-cycle notes,
+                         and the session a silent cycle actually evaluated)
+  test_live_scan_workflow.py ← the hosted workflow: silent-green regressions (a step reading its
+                         own outputs, a digest gated out on weekends, embedded-python syntax)
 universe/nse.txt, config.example.yaml, deploy/
 tools/live_drill.py        ← offline rehearsal of the LIVE path (fake Yahoo feed + mock Bot API)
 tools/mock_telegram_server.py   ← local stand-in for api.telegram.org
@@ -312,6 +323,7 @@ cycle against the live market and prints `RESULT: PASS` or names the first thing
 |---|---|
 | `Telegram not configured` | `.env` needs `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`; check `python -m precision_tap telegram-test` |
 | Token set, chat silent, runs are green | `getMe` passing only proves the *token* — validate the chat too: `python -m precision_tap telegram-test --validate-only` (no message sent). A wrong chat id / un-started bot fails here instead of eating alerts |
+| Two green runs, no alert — and it is a weekend or holiday | **Expected, and now labelled.** `alerts.recent_bars: 1` means a cycle evaluates exactly **one bar**, and on a non-trading day that bar is the *previous* session — so two runs are not two chances, they are the same bar read twice. The cycle names the bar it looked at: `MARKET CLOSED` (Sat/Sun, or a day outside `live.trading_days`), `NO FRESH SESSION` (a trading day, but the EOD print has not settled yet, or you forced `--eod` mid-session), `FEED BEHIND` (the newest bar is older than the session the feed should already have — an NSE holiday, or a lagging provider). The GitHub step summary prints **session evaluated** on the run page, and a non-trading day is annotated with a `::warning::` so it is visible without opening the log. On a weekend the digest is posted by *any* job (there is no later slot to protect) and reports that session's alerts. To scan more than one bar: `alerts.recent_bars: 2-3`, or the `recent_bars` input on a dispatched run (`SCAN_RECENT_BARS` to make it the default) |
 | `SCAN FAILED … exit 2` | the universe resolved to **0 symbols** — a preset (`nifty500`, `allnse`…) whose every download source failed, or an empty/commented file. nseindia archives reject datacenter IPs (GitHub runners included); the presets fall back to Wikipedia tables automatically, but if all sources fail, point `data.universe_file` at a local file (`universe/nse.txt`) |
 | `SCAN FAILED … exit 3` | the feed failed outright (`usable=0`, mostly errors) — provider outage or misconfiguration. A holiday-shaped cycle (fetches ok, no fresh bar) stays green by design |
 | `SCAN FAILED … exit 4` | signals were found but **not** delivered. Two shapes: `DELIVERY PROBLEM` — Telegram rejected the send (usually a 400/403 chat problem); or `NOT SENT … log-only=N` — there was no transport to send with (`telegram.enabled: false`, or the token/chat never reached the process). Fix it and the alerts are re-offered next cycle — a queued row is never held against you by a transport that cannot drain it |
@@ -320,7 +332,7 @@ cycle against the live market and prints `RESULT: PASS` or names the first thing
 | Ran fine, chat is silent, `sent=0 … skipped=N` | you looked at a dry cycle first (`scan --no-send`, or a run with no token). Those alerts are *logged, not delivered*, and the ledger marks them given-up rather than sent — the next cycle with a working bot still sends them. If you are on an older build, `DELETE FROM alerts WHERE sent=2;` in `data/state.sqlite3` clears them |
 | `DELIVERY PROBLEM — … 401 Unauthorized` / `400 chat not found` / `403 bot can't initiate…` | permanent Telegram rejection: the token is wrong, the chat id is wrong, or you never pressed **Start** on the bot (in a group, add it and make it an admin). It is logged at ERROR and *not* retried; fix the credential and the alert is re-offered on the next cycle |
 | `cycle … → delivery sent=0` in the log | the always-on loop now logs the delivery outcome separately from the signal count — a cycle that found three taps and delivered none no longer looks healthy |
-| No alerts at all, ever | first separate *quiet* from *broken*: the cycle summary says which — `nothing to send … no indicator signal` is a quiet market; `usable=0` / `UNIVERSE EMPTY` / `DELIVERY PROBLEM` is a broken pipeline. Then remember the default window is deliberately one bar (`alerts.recent_bars: 1`) and Taps need a zone that is ≥3 bars old, was left by ≥1 ATR and is revisited *on the newest bar* — on a quiet session even 500 names can legitimately produce zero taps. Widen honestly: `alerts.recent_bars: 2-3`, add `new_ob`/`approach` to `alerts.events`, lower `alerts.min_liquidity_dollar_volume` (₹500cr muted the entire mid/small-cap market — the default is now ₹25cr), and scan the broad market (`universe_file: nifty500` or `allnse`) instead of a 127-name starter file. `verify SYM` shows what the engine sees |
+| No alerts at all, ever | first separate *quiet* from *broken*: the cycle summary says which — `nothing to send … no indicator signal` is a quiet market; `usable=0` / `UNIVERSE EMPTY` / `DELIVERY PROBLEM` is a broken pipeline. The summary line and that note both carry `bar=<session>` / `newest <session>`: if it is not today's date, read the `MARKET CLOSED` / `NO FRESH SESSION` / `FEED BEHIND` note above it first — the cycle evaluated an older bar and there was nothing new to find. Then remember the default window is deliberately one bar (`alerts.recent_bars: 1`) and Taps need a zone that is ≥3 bars old, was left by ≥1 ATR and is revisited *on the newest bar* — on a quiet session even 500 names can legitimately produce zero taps. Widen honestly: `alerts.recent_bars: 2-3`, add `new_ob`/`approach` to `alerts.events`, lower `alerts.min_liquidity_dollar_volume` (₹500cr muted the entire mid/small-cap market — the default is now ₹25cr), and scan the broad market (`universe_file: nifty500` or `allnse`) instead of a 127-name starter file. `verify SYM` shows what the engine sees |
 | GitHub Actions runs are green but no alerts ever arrive, and the run times look random | `schedule` is **best-effort** — this repo measured 15 due slots, 5 fired, all 1–4 h late, none inside the NSE session, every run reporting success. The workflow no longer asks cron for a cadence: cron only *kicks* the job (09:05 / 11:25 / 13:05 / 14:55 / 15:25 / 16:15 IST) and the job runs the always-on loop until 17:20 IST or the 5h30m cap. Check `gh run list --workflow=live-scan.yml` for the `schedule` rows against those times; if a whole day is missing, GitHub dropped every kick — for a guarantee run systemd/Docker (`deploy/README.md`) |
 | Alert says `TAP 1` but the zone is already broken | that was a *dead-on-arrival* tap: the same bar touched the entry **and** closed below the stop, so the level failed at the moment it was tapped, and with `include_invalidations: false` the failure was never sent — only the buy side was. `alerts.skip_dead_on_arrival: true` (default) drops them and the cycle tally says `level already failed N`. Set it `false` for strict Pine `anyTap` parity |
 | An alert about yesterday's bar shows today's price / tap count | the live closed-bar parity pass used to replay the whole frame with today's *forming* bar treated as closed, and `Event.zone` is a live reference — so yesterday's alert was rendered with today's tap count, today's raised pre-order, even `state=dead`. The pass now replays `df.iloc[:-1]` and the alert context is taken from the event's own bar (`tests/test_alert_validity.py`) |

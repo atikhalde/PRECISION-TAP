@@ -11,6 +11,8 @@
 #   vars.SCAN_EVENTS     (opt)   e.g. "tap1" or "tap1,approach,confirmed"
 #   vars.SCAN_MIN_DV     (opt)   20d median turnover floor, ₹ crore
 #   vars.SCAN_UNIVERSE   (opt)   nifty50|nifty100|nifty200|nifty500|allnse|file
+#   vars.SCAN_RECENT_BARS (opt)  alert window in bars (config default 1;
+#                                3-5 reviews the week after a weekend/holiday)
 #
 # ── WHY THIS IS NOT "cron EVERY 15 MINUTES" ──────────────────────────────────
 # It used to be, and that is why the scanner looked healthy while the chat stayed
@@ -94,6 +96,10 @@ on:
         description: "Run the whole session loop instead of a single cycle"
         type: boolean
         default: false
+      recent_bars:
+        description: "Alert window in bars (0 = config default; 3-5 reviews the week)"
+        required: false
+        default: "0"
       dry_run:
         description: "Dry run — compute and log, never send to Telegram"
         type: boolean
@@ -234,12 +240,31 @@ jobs:
           scheduled = "${{ github.event_name }}" == "schedule"
           plan = "loop" if (budget >= 120 and (loop_input or scheduled)) else "once"
 
+          # The scanner's own calendar is `live.trading_days`; this is the same
+          # weekday test, so the run page can say "there is no session today"
+          # without anyone opening the log.  NSE holidays are not knowable here
+          # — the scan step reports those from the feed itself (FEED BEHIND).
+          trading_day = now.weekday() < 5
+
           print(f"plan={plan}")
           print(f"budget={max(budget, 0)}")
           print(f"ist_now={now:%Y-%m-%d %H:%M %a}")
           print(f"window_end={end:%H:%M} IST")
+          print(f"trading_day={'true' if trading_day else 'false'}")
           PY
+
+      # A step cannot read its OWN outputs: `${{ steps.plan.outputs.* }}` is
+      # expanded before the script runs.  The notice used to live inside the
+      # step that produced those outputs, so every run annotated itself with
+      # `plan= · now  IST · window closes  IST · budget s` — the one line that
+      # says what the job decided was blank, on the run page where it mattered.
+      - name: Announce the plan
+        run: |
+          echo "plan=${{ steps.plan.outputs.plan }} · now ${{ steps.plan.outputs.ist_now }} IST · window closes ${{ steps.plan.outputs.window_end }} IST · budget ${{ steps.plan.outputs.budget }}s"
           echo "::notice::plan=${{ steps.plan.outputs.plan }} · now ${{ steps.plan.outputs.ist_now }} IST · window closes ${{ steps.plan.outputs.window_end }} IST · budget ${{ steps.plan.outputs.budget }}s"
+          if [ "${{ steps.plan.outputs.trading_day }}" != "true" ]; then
+            echo "::warning::${{ steps.plan.outputs.ist_now }} IST is not an NSE session (weekend). There is no bar forming, so this cycle can only re-read the last completed session — zero alerts is the expected result, not a fault. The scan output says which bar it evaluated (MARKET CLOSED)."
+          fi
 
       # ── the scan ────────────────────────────────────────────────────────────
       # Exit codes: 0 ok (a quiet market is ok), 1 every cycle crashed,
@@ -265,6 +290,15 @@ jobs:
           fi
           if [ -n "${{ vars.SCAN_EVENTS }}" ]; then
             SETS+=(--events "${{ vars.SCAN_EVENTS }}")
+          fi
+          # `alerts.recent_bars: 1` means a cycle evaluates exactly one bar, so a
+          # weekend/holiday dispatch can only re-read the last completed session.
+          # Widening the window is how you ask "what did I miss this week?" from
+          # the Actions tab — the ledger still dedupes whatever an earlier cycle
+          # already delivered, so it re-reports, never re-sends.
+          RECENT="${{ vars.SCAN_RECENT_BARS || inputs.recent_bars || '0' }}"
+          if [ -n "$RECENT" ] && [ "$RECENT" != "0" ]; then
+            SETS+=(--recent-bars "$RECENT")
           fi
           # universe override: nifty50 | nifty100 | nifty200 | nifty500 |
           # allnse (whole exchange) | a repo file path, e.g. universe/nse.txt
@@ -324,14 +358,28 @@ jobs:
           acc = " · ".join(f"{k} {v}" for k, v in sorted(kinds.items())) or "—"
           print(f"## Precision Tap — {rep.get('mode', '?')} scan "
                 f"(latest of {len(files)} cycle report(s))")
+          # Which bar was evaluated is the first thing to read on a silent run:
+          # `alerts.recent_bars: 1` means a cycle looks at exactly one session,
+          # so a weekend/holiday cycle re-reads the previous one and finding
+          # nothing there is the correct answer, not a broken pipeline.
+          bar = rep.get("bar_session") or "—"
+          state = rep.get("market_state") or "n/a"
+          run_on = rep.get("session_now") or "—"
+          # Only an exchange-tracked feed can be "behind today": a frozen replay
+          # (csv / synthetic / --end) has no session to miss.
+          behind = state in ("open", "closed") and bar not in (run_on, "—")
+          print(f"**session evaluated** `{bar}` · **cycle ran on** {run_on} · "
+                f"**market** {state}"
+                + (" · ⚠ not today's session" if behind else ""))
           print(f"**universe** {rep.get('universe')} · **usable** {rep.get('usable')} · "
                 f"**errors** {rep.get('errors')} · **with zones** {rep.get('symbols_with_zones')}")
           print(f"**events in window** {rep.get('events_in_window')} · "
                 f"**filtered** {rep.get('filtered')} · **skipped symbols** {rep.get('skipped_symbols')}")
           print(f"**alerts** {n_alerts} ({acc}) · **delivery** `{rep.get('delivery') or '—'}`")
           show = [n for n in rep.get("notes", []) if n.startswith(
-              ("FEED PROBLEM", "DELIVERY PROBLEM", "NOT SENT", "no usable symbols",
-               "UNIVERSE EMPTY", "nothing to send", "also filtered"))]
+              ("FEED PROBLEM", "FEED BEHIND", "DELIVERY PROBLEM", "NOT SENT", "no usable symbols",
+               "UNIVERSE EMPTY", "MARKET CLOSED", "NO FRESH SESSION", "nothing to send",
+               "also filtered"))]
           for n in show[:6]:
               print(f"- {n}")
           if n_alerts:
@@ -351,15 +399,22 @@ jobs:
         if: ${{ always() && steps.scan.outcome == 'success' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
         run: |
           python - <<'PY' > digest.txt
-          import datetime, sqlite3, sys
+          import datetime, glob, json, os, sqlite3, sys
           from zoneinfo import ZoneInfo
 
           now = datetime.datetime.now(ZoneInfo("Asia/Kolkata"))
-          # Before the settled-EOD scan at 16:10 IST the day is not over yet.
-          # Exiting 0 with an empty file is the signal to post nothing — a
+          # Before the settled-EOD scan at 16:10 IST a *trading* day is not over
+          # yet.  Exiting 0 with an empty file is the signal to post nothing — a
           # non-zero exit here would fail the job (and fire the Telegram failure
           # notice) on every morning kick, which is a perfectly normal outcome.
-          if (now.hour, now.minute) < (16, 40):
+          #
+          # A weekend is different and used to be silenced by the same test: the
+          # ledger makes this digest once-per-date, so posting it at 09:35 would
+          # consume the slot — but on a Saturday there is no slot to protect,
+          # nothing left to wait for, and a manual dispatch is exactly the case
+          # where the chat ends up silent *and* unexplained.  So the early-exit
+          # now only applies to a trading day.
+          if now.weekday() < 5 and (now.hour, now.minute) < (16, 40):
               sys.stderr.write("digest skipped: too early in the session\n")
               raise SystemExit(0)
 
@@ -379,28 +434,58 @@ jobs:
           except Exception as exc:        # a broken ledger must not eat the digest
               sys.stderr.write(f"ledger guard unavailable ({exc})\n")
 
+          # Which session did the last cycle actually evaluate?  On a weekend or
+          # a holiday that is *not* today, and it is the difference between "no
+          # signals fired today" (which reads as a broken scanner) and "there was
+          # no session today; the last one, 2026-09-11, produced N".
+          rep = {}
+          files = sorted(glob.glob("results/scan_*.json"), key=os.path.getmtime)
+          if files:
+              try:
+                  with open(files[-1]) as fh:
+                      rep = json.load(fh)
+              except Exception as exc:
+                  sys.stderr.write(f"scan report unreadable ({exc})\n")
+          session = str(rep.get("bar_session") or "")
+          ist_today = now.date().isoformat()
+
           today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-          rows = ledger.execute(
-              "SELECT symbol, event, sent FROM alerts "
-              "WHERE substr(created_at,1,10) = ? AND symbol != '__digest__' "
-              "ORDER BY created_at", (today,)).fetchall()
+          q = ("SELECT symbol, event, sent FROM alerts "
+               "WHERE {col} = ? AND symbol != '__digest__' ORDER BY created_at")
+          rows = ledger.execute(q.format(col="substr(created_at,1,10)"), (today,)).fetchall()
+          # The evaluated session's own tally, whenever it was recorded — on a
+          # Saturday this is the answer to "did Friday produce anything?".
+          srows = (ledger.execute(q.format(col="bar_date"), (session,)).fetchall()
+                   if session else [])
           run = ledger.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
-          kinds = {}
-          for r in rows:
-              kinds[r["event"]] = kinds.get(r["event"], 0) + 1
-          sent = sum(1 for r in rows if r["sent"] == 1)
-          queued = sum(1 for r in rows if r["sent"] == 0)
+
           out = [f"\U0001F5D3 <b>Precision Tap · end of day {now.date().isoformat()}</b>"]
-          if rows:
+          if session and session != ist_today:
+              out.append(f"<b>market closed</b> — no session today; the newest bar evaluated "
+                         f"was <b>{session}</b>")
+          elif session:
+              out.append(f"session evaluated <b>{session}</b>")
+
+          shown, when = (rows, "recorded today") if rows else (srows, f"for the {session} session")
+          if shown:
+              kinds = {}
+              for r in shown:
+                  kinds[r["event"]] = kinds.get(r["event"], 0) + 1
               acc = " · ".join(f"{k} {v}" for k, v in sorted(kinds.items()))
-              out.append(f"{len(rows)} alert(s): {acc}")
-              out.append(f"delivered {sent} · queued {queued}")
+              sent = sum(1 for r in shown if r["sent"] == 1)
+              queued = sum(1 for r in shown if r["sent"] == 0)
+              given_up = sum(1 for r in shown if r["sent"] == 2)
+              out.append(f"{len(shown)} alert(s) {when}: {acc}")
+              out.append(f"delivered {sent} · queued {queued}"
+                         + (f" · not delivered {given_up}" if given_up else ""))
               out.append("")
-              for r in rows[-15:]:
+              for r in shown[-15:]:
                   mark = {1: "✅", 0: "⏳", 2: "⛔"}.get(r["sent"], "•")
                   out.append(f"{mark} <code>{r['symbol']}</code> {r['event']}")
           else:
-              out.append("No signals fired today — gates not met, or a market holiday.")
+              out.append("No signals fired — the enabled events "
+                         "(new_ob / tap1 / approach / confirmed) did not occur on the bar in the "
+                         "alert window. Gates not met, a quiet session, or no session at all.")
           if run:
               out.append("")
               out.append(f"<i>last cycle {run['mode']} · universe {run['symbols']} · "

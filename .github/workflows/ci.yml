@@ -44,6 +44,12 @@ jobs:
       - name: Run alert-delivery regressions
         run: python -m pytest tests/test_alert_delivery.py -q
 
+      # the hosted workflow's own silent-green regressions: a step that cannot
+      # read its own outputs, a digest gated out on the days people go looking,
+      # and embedded python that only a runner would otherwise parse.
+      - name: Run live-scan workflow regressions
+        run: python -m pytest tests/test_live_scan_workflow.py -q
+
       - name: Run scanner workflow tests
         run: python -m pytest tests/test_scanner_backtest.py -k scanner -q
 
