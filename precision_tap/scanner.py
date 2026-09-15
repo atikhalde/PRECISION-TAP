@@ -270,8 +270,16 @@ class Scanner:
         cfg = self.cfg
         t_start = time.time()
         if live is None:
-            live = _market_open(cfg.live.market_timezone, session=(cfg.live.session_open,
-                                                                   cfg.live.session_close)) and not end
+            # Auto mode reads the module's single clock (`_session_now`), not a
+            # second, unpinned `datetime.now` — a test that pins the exchange
+            # clock must not get a live-vs-EOD decision from the host wall clock,
+            # and the two sources can disagree on the hour boundary.  In
+            # production `_session_now` is the real clock, so behaviour is the
+            # same; this only makes the decision testable and single-sourced.
+            live = _market_open(cfg.live.market_timezone,
+                                now=_session_now(cfg.live.market_timezone),
+                                session=(cfg.live.session_open,
+                                         cfg.live.session_close)) and not end
         requested_live = bool(live and not end)
         # Keep the scanner's source in sync with the cycle.  The old code used a
         # throw-away local source here, leaving ``scan_symbol`` and chart/cache
