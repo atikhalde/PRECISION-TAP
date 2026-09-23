@@ -19,7 +19,8 @@ import pytest
 
 from precision_tap.alerts import passes_filters, render_message
 from precision_tap.data import Bars, DataSource, normalize_ohlcv, synthetic_frame
-from precision_tap.engine import EV_APPROACH, EV_TAP, ST_DEAD, ST_TAPPED, Event, Zone, run_engine
+from precision_tap.engine import (EV_APPROACH, EV_CONFIRMED, EV_TAP, ST_CONFIRMED, ST_DEAD,
+                                  ST_TAPPED, Event, Zone, run_engine)
 from precision_tap.params import AlertConfig, Params
 from precision_tap.scanner import Scanner
 
@@ -191,3 +192,150 @@ def test_rendered_alert_never_quotes_a_stop_above_the_price_it_advertises():
     assert f"{z.entry:.2f}" in text
     assert f"{z.stop:.2f}" in text
     assert not math.isnan(z.risk) and z.risk > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the defence-confirmed alert has its own message, not the tap block
+# ─────────────────────────────────────────────────────────────────────────────
+def _confirmed(zone: Zone, bar: int = 42, close: float = 134.10) -> Event:
+    return Event(kind=EV_CONFIRMED, bar=bar, symbol="TCS.NS", zid=zone.zid, level=zone.top,
+                 price=close, ts=pd.Timestamp("2026-09-22"), zone=zone,
+                 detail={"rvol": 1.8, "clv": 0.81, "micro_bos": 0.42})
+
+
+def _confirmed_zone(**kw) -> Zone:
+    base = dict(zid=3, born=30, origin=29, top=131.84, bot=129.60, entry=132.90,
+                entry0=132.32, stop=129.20, atr0=2.6, taps=1, tap_bars=[40],
+                state=ST_CONFIRMED, departed=True, adaptive=True, confirm_bar=42)
+    base.update(kw)
+    return Zone(**base)
+
+
+def _confirmed_ctx(z: Zone, **over):
+    ctx = {"price": 134.10, "change_pct": 1.9, "atr": 2.6, "rvol": 0.9,   # newest-bar rvol ≠ defence bar's
+           "exchange": "NSE", "timeframe": "1d", "entry": z.entry, "origin_date": "2026-09-02"}
+    ctx.update(over)
+    return ctx
+
+
+def test_confirmed_alert_is_not_rendered_as_a_buy_order():
+    """A defence confirmation is a verdict on the tap, not a new entry.
+
+    Reusing the Tap block prints "Buy limit / Dist to lvl" for a level price
+    has already left, which reads like a late Tap 1.  The confirmed message
+    must carry none of the order vocabulary and name the level that *held*.
+    """
+    z = _confirmed_zone()
+    text = render_message(_confirmed(z), _confirmed_ctx(z), AlertConfig(), Params.default(),
+                          parse_mode="plain")
+    head = text.splitlines()[0]
+    assert "OB DEFENCE CONFIRMED" in head and head.startswith("🛡")
+    assert "Buy limit" not in text
+    assert "Dist to lvl" not in text
+    assert "trigger" not in text
+    assert "Defended" in text and "132.32" in text        # the level Tap 1 touched (entry0) …
+    assert "Tap 1 held" in text
+    assert "129.20" in text                                # … and the stop that still applies
+    assert "not a fresh entry" in text
+
+
+def test_confirmed_alert_describes_the_defence_bar():
+    """RVOL / CLV / micro-BOS are the *defence bar's* numbers, against the gates."""
+    z = _confirmed_zone()
+    p = Params.default()
+    text = render_message(_confirmed(z), _confirmed_ctx(z), AlertConfig(), p, parse_mode="plain")
+    assert "confirmed 2 bars after the tap" in text          # bar 42 − tap bar 40
+    assert f"(window {p.confirm_bars})" in text
+    assert "RVOL 1.8×" in text and "RVOL 0.9×" not in text    # detail wins over ctx
+    assert f"(≥ {p.confirm_rvol:.1f})" in text
+    assert "CLV 0.81" in text and f"(≥ {p.confirm_clv:.2f})" in text
+    assert "micro-BOS +0.42" in text
+    assert "state → confirmed" in text
+
+
+def test_confirmed_alert_reports_open_r_from_the_defended_level():
+    z = _confirmed_zone()
+    text = render_message(_confirmed(z), _confirmed_ctx(z), AlertConfig(), Params.default(),
+                          parse_mode="plain")
+    risk = z.entry0 - z.stop                                  # 3.12
+    r_now = (134.10 - z.entry0) / risk                        # 0.57 R
+    assert f"({r_now:.2f} R from Tap 1)" in text
+    # targets are still measured from the defended level, so they line up with
+    # the Tap 1 alert the user already has on screen
+    assert f"R1 {z.entry0 + risk:.2f}" in text
+    # a raised pre-order is mentioned as a *revisit* level, not as a buy limit
+    assert "next pre-order 132.90" in text
+
+
+def test_confirmed_after_a_repeat_tap_names_the_live_level():
+    """Tap 2+ touch the (possibly raised) live entry, so that is what was defended."""
+    z = _confirmed_zone(taps=2, tap_bars=[40, 45], confirm_bar=46)
+    text = render_message(_confirmed(z, bar=46), _confirmed_ctx(z), AlertConfig(),
+                          Params.default(), parse_mode="plain")
+    assert "Tap 2 held" in text
+    assert "Defended     132.90" in text
+    assert "confirmed 1 bar after the tap" in text
+
+
+def test_confirmed_alert_survives_every_parse_mode():
+    z = _confirmed_zone()
+    ev, ctx = _confirmed(z), _confirmed_ctx(z)
+    html = render_message(ev, ctx, AlertConfig(), Params.default(), parse_mode="HTML")
+    assert html.startswith("<b>🛡 OB DEFENCE CONFIRMED</b>")
+    assert "P&amp;L" in html and "<" not in html.replace("<b>", "").replace("</b>", "") \
+        .replace("<i>", "").replace("</i>", "")
+    md = render_message(ev, ctx, AlertConfig(), Params.default(), parse_mode="MarkdownV2")
+    assert "OB DEFENCE CONFIRMED" in md
+    assert "\\." in md                                        # escaped for MarkdownV2
+
+
+def test_tap_alert_is_unchanged_by_the_confirmed_layout():
+    """The order block stays exactly as before for taps — only `confirmed` moved."""
+    z = _confirmed_zone(state=ST_TAPPED)
+    tap = Event(kind=EV_TAP, bar=40, symbol="TCS.NS", zid=z.zid, tap_no=1, level=z.entry0,
+                price=131.7, ts=pd.Timestamp("2026-09-18"), zone=z)
+    text = render_message(tap, _confirmed_ctx(z, price=131.71, change_pct=-0.14),
+                          AlertConfig(), Params.default(), parse_mode="plain")
+    assert "Buy limit    132.32   ← Tap 1 trigger" in text
+    assert "Dist to lvl" in text
+    assert "Defended" not in text
+
+
+def test_engine_confirmed_event_renders_through_the_dispatcher():
+    """End to end: a real engine `confirmed` reaches Telegram as its own message.
+
+    The synthetic frame (seed 0) produces several defences; render the last one
+    exactly as the dispatcher would and check it took the dedicated layout.
+    """
+    from precision_tap.alerts import AlertDispatcher
+    from precision_tap.data import synthetic_frame
+
+    df = synthetic_frame(seed=0)
+    p = Params.default()
+    res = run_engine(df, p, symbol="SYN.NS")
+    conf = res.by(EV_CONFIRMED)
+    assert conf, "fixture must produce a defence"
+    ev = conf[-1]
+    ctx = {"price": float(df["close"].iloc[ev.bar]), "atr": 1.0, "exchange": "NSE",
+           "timeframe": "1d", "entry": ev.zone.entry}
+
+    class _TG:
+        dry_run = False
+        configured = True
+        cfg = type("C", (), {"parse_mode": "plain"})()
+        sent = []
+
+        def send_text(self, text, **kw):
+            self.sent.append(text)
+            return [type("R", (), {"ok": True, "error": "", "permanent": False})()]
+
+    tg = _TG()
+    cfg = AlertConfig(events=["tap1", "confirmed"], chart=False)
+    d = AlertDispatcher(cfg, tg, store=None, params=p)
+    out = d.dispatch([(ev, ctx)])
+    assert out.sent == 1 and len(tg.sent) == 1
+    msg = tg.sent[0]
+    assert msg.startswith("🛡 OB DEFENCE CONFIRMED")
+    assert "Defended" in msg and "held" in msg
+    assert "Buy limit" not in msg
+    assert f"{ev.zone.stop:.2f}" in msg

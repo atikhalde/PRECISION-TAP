@@ -140,6 +140,13 @@ def render_lines(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) -> Li
 
     if z is None:
         return lines
+    if ev.kind == EV_CONFIRMED:
+        # A defence confirmation is a *state change*, not a level to buy: the
+        # generic block below advertises "Buy limit / Stop / R1–R3 / Dist to
+        # lvl" for a price that has already left the zone, so it reads like a
+        # late Tap message.  It gets its own layout instead.
+        lines.extend(_confirmed_body(ev, ctx, cfg, params))
+        return lines
     entry_now = float(ctx.get("entry") or z.entry)
     # On a tap the head-line level must be the one that was actually touched —
     # `raise_after_first_tap` lifts the zone's pre-order *on the tap bar*, so
@@ -206,6 +213,77 @@ def render_lines(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) -> Li
     if ev.kind == EV_NEW:
         lines.append(f"fresh zone; taps enabled after {params.min_age} bars "
                      f"(needs +{_num(params.require_departure, 1)}×ATR above {_num(z.top)})")
+    lines.append(RULE_LINE)
+    lines.append("not investment advice · Precision Tap scanner")
+    return lines
+
+
+def _confirmed_body(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) -> List[str]:
+    """Body of the 🛡 OB DEFENCE CONFIRMED message.
+
+    The Tap alert is an *order*: buy here, stop there, targets.  This one is a
+    *verdict* on that order — the level held, buyers stepped in and price
+    closed back above the block with volume and a micro break of structure.
+    So the block answers a different set of questions:
+
+    * which tap was defended, at what price, and how many bars it took;
+    * what the defence bar looked like (close vs OB top, RVOL, CLV, micro-BOS);
+    * where the stop still is and how far price has already travelled in R
+      (the trade is *on*, and it may already be at R1 by the time this prints).
+
+    Nothing here is a new entry — a defended level does not owe a retest.
+    """
+    z: Zone = ev.zone
+    price = float(ctx.get("price") or ev.price or z.top)
+    close = float(ev.price) if math.isfinite(ev.price) else price
+    stop = float(z.stop)
+    tap_bar = z.tap_bars[-1] if z.tap_bars else -1
+    # The level that was *defended* is the one the last tap touched.  Tap 1 is
+    # always at the creation level (`raise_after_first_tap` lifts the pre-order
+    # only after that touch); every later tap is at the live `entry`.
+    tapped_at = float(z.entry0) if z.taps <= 1 else float(z.entry)
+    risk = tapped_at - stop
+    gain = close - tapped_at
+    r_now = gain / risk if risk else math.nan
+    bars_to_confirm = (ev.bar - tap_bar) if tap_bar >= 0 else None
+    # the *defence bar's* RVOL/CLV (engine detail), not whatever the newest bar shows
+    rvol = ev.detail.get("rvol", ctx.get("rvol"))
+    clv = ev.detail.get("clv")
+    bos = ev.detail.get("micro_bos")
+    lines: List[str] = []
+    lines.append(f"📌 Price        {_num(price)}"
+                 + (f"  ({_pct(ctx.get('change_pct'))})" if ctx.get("change_pct") is not None else ""))
+    tap_lbl = f"Tap {z.taps}" if z.taps else "tap"
+    lines.append(f"✅ Defended     {_num(tapped_at)}   ← {tap_lbl} held")
+    lines.append(f"⬜ OB zone       {_num(z.top)} → {_num(z.bot)}")
+    lines.append(f"🔴 Stop         {_num(stop)}   ({_pct(-(close - stop) / close * 100 if close else math.nan)} from close)")
+    lines.append(f"📈 vs OB top    +{_num(close - z.top)}   "
+                 f"({_pct((close / z.top - 1.0) * 100 if z.top else math.nan)} above {_num(z.top)})")
+    targets = [_num(tapped_at + risk * k) for k in (1.0, 2.0, 3.0)]
+    lines.append(f"🎯 Targets      R1 {targets[0]} · R2 {targets[1]} · R3 {targets[2]}")
+    lines.append(f"📏 Open P&L     {_num(gain)} ({_num(r_now)} R from {tap_lbl})")
+    lines.append(RULE_LINE)
+
+    facts: List[str] = []
+    if bars_to_confirm is not None:
+        unit = "bar" if bars_to_confirm == 1 else "bars"
+        facts.append(f"confirmed {bars_to_confirm} {unit} after the tap"
+                     f" (window {params.confirm_bars})")
+    if rvol is not None:
+        facts.append(f"RVOL {_num(rvol, 1)}× (≥ {_num(params.confirm_rvol, 1)})")
+    if clv is not None:
+        facts.append(f"CLV {_num(clv, 2)} (≥ {_num(params.confirm_clv, 2)})")
+    if bos is not None and math.isfinite(float(bos)):
+        facts.append(f"micro-BOS +{_num(bos)} over {params.confirm_bos_len}-bar high")
+    lines.append(" · ".join(facts) if facts else "close > OB top with volume and a micro-BOS")
+    age = ev.bar - z.born
+    lines.append(f"zone age {age} bars · taps {z.taps}/{params.max_touches} · state → confirmed")
+    origin = ctx.get("origin_date") or ""
+    if origin:
+        lines.append(f"origin candle {origin} · {ctx.get('zone_method', params.zone_method)}")
+    if z.adaptive and math.isfinite(z.entry):
+        lines.append(f"next pre-order {_num(z.entry)} if price revisits the block")
+    lines.append("defence confirmed — manage the open trade; this is not a fresh entry")
     lines.append(RULE_LINE)
     lines.append("not investment advice · Precision Tap scanner")
     return lines

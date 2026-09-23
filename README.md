@@ -34,6 +34,29 @@ defence: close > 131.84 within 3 bars, RVOL ≥ 1.3×, CLV ≥ 0.65
 [ 📈 Chart ]  [ 🔎 Quote ]        ← inline buttons (+ a candlestick chart with the OB drawn on it)
 ```
 
+When the tapped level then **holds** (a closed bar back above the OB with volume, CLV and a
+micro break of structure — the indicator's `DEFENCE CONFIRMED` label), a **separate** message
+follows in the same chat. It is a verdict on the tap, not a new order, so it has its own layout:
+
+```
+🛡 OB DEFENCE CONFIRMED
+TCS.NS · NSE · 1d · 2024-09-10
+──────────────────────────────
+📌 Price        134.10  (+1.90%)
+✅ Defended     132.32   ← Tap 1 held
+⬜ OB zone       131.84 → 129.60
+🔴 Stop         129.20   (-3.65% from close)
+📈 vs OB top    +2.26   (+1.71% above 131.84)
+🎯 Targets      R1 135.44 · R2 138.56 · R3 141.68
+📏 Open P&L     1.78 (0.57 R from Tap 1)
+──────────────────────────────
+confirmed 2 bars after the tap (window 3) · RVOL 1.8× (≥ 1.3) · CLV 0.81 (≥ 0.65) · micro-BOS +0.42 over 3-bar high
+zone age 12 bars · taps 1/4 · state → confirmed
+origin candle 2024-09-02 · Open to low
+next pre-order 132.90 if price revisits the block
+defence confirmed — manage the open trade; this is not a fresh entry
+```
+
 * **Logic parity:** the port is bar-exact, verified by 18 hand-computed fixtures
   (`python -m precision_tap.selftest`) — see [ANALYSIS.md](ANALYSIS.md) for the rule-by-rule derivation.
 * **Live:** polls during the NSE session (intraday touch = TradingView "Once Per Bar") and runs
