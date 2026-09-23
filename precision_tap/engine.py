@@ -389,6 +389,12 @@ def run_engine(
         ai = ai if math.isfinite(ai) else 0.0
 
         # ── new zone (closed bars only — the non-repainting half) ─────────
+        # Pine's `displacement` expression itself carries `barstate.isconfirmed`,
+        # so `plotshape(displacement and not duplicate)` — the "OB" diamond and
+        # the `new_ob` alertcondition — is always false on the forming bar.  The
+        # detection array is pre-gate (the sequential half needs it), so the mask
+        # is cleared below for the bars Pine would not mark; `verify` prints it
+        # as "plotshape parity", and tests/test_pine_reference.py diffs it.
         if displacement[i] and confirmed:
             top, bot = float(raw_top[i]), float(raw_bot[i])
             if math.isfinite(top) and math.isfinite(bot) and top > bot:
@@ -414,6 +420,12 @@ def run_engine(
                     A["displacement"][i] = False       # keep plotshape == creation parity
             else:
                 A["displacement"][i] = False
+        elif displacement[i]:
+            # Pine's `displacement` term *is* `barstate.isconfirmed and …`, so the
+            # OB diamond and the `new_ob` alertcondition can never fire on the
+            # forming bar even though the detection array (which the sequential
+            # half consumes) is true there.
+            A["displacement"][i] = False
 
         # ── max_zones eviction (Pine shifts the oldest) ───────────────────
         while len(zones) > max_zones:
@@ -470,7 +482,20 @@ def run_engine(
                              atr=ai, rvol=rvol_i, touched_bot=z.bot,
                              adaptive_entry=z.entry if z.adaptive else float("nan"))
 
-                # defence confirmation (closed bars only)
+                # ── defence confirmation (closed bars only) ───────────────
+                # This is INDICATOR.txt's `defence` expression, gate for gate and
+                # in the same order:
+                #
+                #   pending   = state == 1 and tapBar >= 0 and bar_index - tapBar <= confirmBars
+                #   microBOS  = close > ta.highest(high[1], confirmBOSLen)
+                #   defence   = barstate.isconfirmed and pending and close > open
+                #               and clv >= confirmCLV and rvol >= confirmRVOL
+                #               and close > top and microBOS
+                #
+                # `microBOS` is `na` (then false) while `ta.highest` has no history
+                # yet, which is what the `isfinite(bosv)` guard reproduces.  Every
+                # gate is also recorded on the event so the alert can print the
+                # indicator's rule with the numbers the bar actually printed.
                 pending = z.state == ST_TAPPED and bool(z.tap_bars) and (i - z.tap_bars[-1]) <= p.confirm_bars
                 if confirmed and pending and close_i > open_i and clv_i >= p.confirm_clv \
                         and rvol_i >= p.confirm_rvol and close_i > z.top \
@@ -478,8 +503,18 @@ def run_engine(
                     z.state = ST_CONFIRMED
                     z.confirm_bar = i
                     any_confirm[i] = True
+                    # ``Event.zone`` is a *live* reference: on the very next bar
+                    # the indicator may tap the confirmed block again (state 2 is
+                    # still tappable), which moves ``taps``/``entry`` past what the
+                    # defence bar actually saw.  Snapshot the rendering inputs so
+                    # the 🛡 message always describes the bar that confirmed.
                     emit(EV_CONFIRMED, i, z, level=z.top, price=close_i,
-                         rvol=rvol_i, clv=clv_i, micro_bos=float(close_i - bosv))
+                         rvol=rvol_i, clv=clv_i, micro_bos=float(close_i - bosv),
+                         open=open_i, close=close_i, zone_top=float(z.top), bos_ref=float(bosv),
+                         bars_since_tap=i - z.tap_bars[-1], confirm_window=int(p.confirm_bars),
+                         closed_bar=True, taps_at_event=int(z.taps),
+                         tap_bar=int(z.tap_bars[-1]), state_at_event=z.state,
+                         entry_at_event=float(z.entry0 if z.taps <= 1 else z.entry))
                 elif z.state == ST_TAPPED and z.tap_bars and (i - z.tap_bars[-1]) > p.confirm_bars:
                     z.state = ST_FRESH          # pending window expired -> back to fresh
 

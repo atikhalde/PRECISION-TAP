@@ -29,7 +29,8 @@ TCS.NS · NSE · 1d · 2024-09-06
 ──────────────────────────────
 zone age 3 bars · taps 1/4 · departure ✔ · RVOL 0.7× · ATR 2.60 (2.0%)
 origin candle 2024-09-02 · Open to low
-defence: close > 131.84 within 3 bars, RVOL ≥ 1.3×, CLV ≥ 0.65
+defence: closed bar within 3 bars of the tap · close > open · close > 131.84
+         CLV ≥ 0.65 · RVOL ≥ 1.3× · close > 3-bar high
 ──────────────────────────────
 [ 📈 Chart ]  [ 🔎 Quote ]        ← inline buttons (+ a candlestick chart with the OB drawn on it)
 ```
@@ -50,15 +51,22 @@ TCS.NS · NSE · 1d · 2024-09-10
 🎯 Targets      R1 135.44 · R2 138.56 · R3 141.68
 📏 Open P&L     1.78 (0.57 R from Tap 1)
 ──────────────────────────────
-confirmed 2 bars after the tap (window 3) · RVOL 1.8× (≥ 1.3) · CLV 0.81 (≥ 0.65) · micro-BOS +0.42 over 3-bar high
+confirmed 2 bars after the tap (window 3) · closed bar ✔ · close 134.10 > open 131.60 ✔
+CLV 0.81 (≥ 0.65) ✔ · RVOL 1.8× (≥ 1.3) ✔ · close > OB top 131.84 ✔
+micro-BOS close 134.10 > 3-bar high 133.68 ✔ (by 0.42)
 zone age 12 bars · taps 1/4 · state → confirmed
 origin candle 2024-09-02 · Open to low
 next pre-order 132.90 if price revisits the block
 defence confirmed — manage the open trade; this is not a fresh entry
 ```
 
-* **Logic parity:** the port is bar-exact, verified by 18 hand-computed fixtures
-  (`python -m precision_tap.selftest`) — see [ANALYSIS.md](ANALYSIS.md) for the rule-by-rule derivation.
+* **Logic parity:** the port is bar-exact, verified by 21 hand-computed fixtures
+  (`python -m precision_tap.selftest`) plus a line-by-line differential against an independent
+  transcription of `INDICATOR.txt` (`tests/pine_reference.py`, run by `pytest -q`). The defence
+  gates get their own markets: taps followed by *near-miss* defence bars (bearish close, low CLV,
+  no volume, close under the OB top, close under the 3-bar high) and a block that is **defended
+  twice**, so deleting a gate shows up as a difference rather than as silence. See
+  [ANALYSIS.md](ANALYSIS.md) for the rule-by-rule derivation.
 * **Live:** polls during the NSE session (intraday touch = TradingView "Once Per Bar") and runs
   scheduled scans at/after the close (closed-bar = "Once Per Bar Close").
 * **No repaint surprises:** zones are only *created* on closed bars, exactly like the indicator.
@@ -94,14 +102,20 @@ Python ≥ 3.9. `matplotlib` is only needed for chart attachments / the equity P
    For a group/channel, add the bot and use its `-100…` id. No network? Test the whole delivery
    path locally: `python tools/mock_telegram_server.py 8099` + `--set telegram.api_base=http://127.0.0.1:8099`.
 
+   `init` copies this repo's `.env.example`, sample token included. That sample is well-formed, so
+   the scanner treats it as *unconfigured* rather than trying to send with it: `doctor` and
+   `livecheck` will say the credentials are still the sample ones, and every alert is logged, never
+   delivered — replace the token before expecting a chat to light up.
+
 ## 3. Sanity checks before going live
 
 ```bash
 python -m precision_tap doctor --net      # deps, universe, tz/session, token+chat, live data probe
-python -m precision_tap selftest          # 18 Pine-parity checks (offline, deterministic)
+python -m precision_tap selftest          # 21 Pine-parity checks (offline, deterministic)
 python -m precision_tap demo              # full offline pipeline on synthetic NSE-style data
 python tools/live_drill.py                # the LIVE path offline: fake Yahoo feed → mock Telegram
 python tools/signal_audit.py              # are the alerts *valid*? realistic (not engineered) market
+python tools/mutation_probe.py            # can the suite *see* a broken defence rule? (deletes each gate)
 python -m precision_tap scan --no-send    # one real cycle, prints instead of sending
 python -m precision_tap livecheck         # config → real Telegram → real feed → one real cycle
 python -m precision_tap verify RELIANCE.NS   # every zone + every event, for TradingView diffing
@@ -311,7 +325,7 @@ precision_tap/
   engine.py     ← the Pine state machine (zones, taps, defence, invalidation) — the parity surface
   series.py     ← Pine-exact ta.atr/sma/rma/highest/lowest/tr primitives
   params.py     ← every input mirrored 1:1, plus trade/alert/telegram/live/data config
-  selftest.py   ← 18 hand-computed parity fixtures (also run by pytest)
+  selftest.py   ← 21 hand-computed parity fixtures (also run by pytest)
   data.py       ← yfinance/yahoo/csv/synthetic providers, NSE universe presets, cache, intraday bar
   scanner.py    ← live scan: universe → engine → filters → dedupe → dispatch
   alerts.py     ← filtering, Telegram message rendering, dispatch, retry queue
@@ -333,6 +347,7 @@ tests/          ← pytest: parity wrappers, yfinance adapter (fake), Telegram (
                          own outputs, a digest gated out on weekends, embedded-python syntax)
 universe/nse.txt, config.example.yaml, deploy/
 tools/live_drill.py        ← offline rehearsal of the LIVE path (fake Yahoo feed + mock Bot API)
+tools/mutation_probe.py    ← deletes each `defence` gate in turn to prove the tests notice
 tools/mock_telegram_server.py   ← local stand-in for api.telegram.org
 .github/workflows/   ← ci.yml (offline parity + tests) and live-scan.yml (real market → Telegram)
 ```

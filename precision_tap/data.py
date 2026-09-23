@@ -548,7 +548,7 @@ class DataSource:
         # entire scan — the outcome is still reported per symbol, never hidden.
         if not bars.ok and bars.error and getattr(cfg, "fallback_provider", "") and end is None:
             fb = cfg.fallback_provider
-            primary_error = bars.error
+            primary_error = bars.error      # already labelled `<provider>: <what it said>`
             try:
                 bars = self._fetch(symbol, days, end, fb)
                 if bars.ok:
@@ -557,11 +557,11 @@ class DataSource:
                     bars.source = f"{bars.source}+failover"
                 else:
                     bars = Bars(symbol=symbol, df=pd.DataFrame(columns=OHLCV),
-                                error=f"{cfg.provider}: {primary_error}; {fb}: {bars.error}")
+                                error=f"{primary_error}; {fb}: {bars.error}")
             except Exception as exc2:
                 log.debug("failover fetch failed for %s via %s: %s", symbol, fb, exc2)
                 bars = Bars(symbol=symbol, df=pd.DataFrame(columns=OHLCV),
-                            error=f"{cfg.provider}: {primary_error}; {fb}: {exc2}")
+                            error=f"{primary_error}; {fb}: {exc2}")
         if bars.ok and use_cache and bars.source != "cache":
             self.cache.store(key, bars.df)
         return bars
@@ -662,7 +662,7 @@ class DataSource:
             except Exception as exc:
                 last = exc
                 time.sleep(self.cfg.retry_backoff ** attempt)
-        raise RuntimeError(f"yahoo request failed after {self.cfg.retry_max} tries: {last}")
+        raise RuntimeError(f"request failed after {self.cfg.retry_max} tries: {last}")
 
     def _yahoo(self, symbol: str, days: int, end: Optional[str]) -> Bars:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -746,7 +746,7 @@ class DataSource:
                 log.debug("%s: yfinance attempt %d/%d failed (%s) — retrying",
                           what, attempt, self.cfg.retry_max, exc)
                 time.sleep(self.cfg.retry_backoff ** attempt)
-        raise RuntimeError(f"yfinance {what} failed after {self.cfg.retry_max} tries: {last}")
+        raise RuntimeError(f"{what} failed after {self.cfg.retry_max} tries: {last}")
 
     def _yfinance(self, symbol: str, days: int, end: Optional[str]) -> Bars:
         import yfinance as yf
@@ -767,7 +767,7 @@ class DataSource:
         tk = yf.Ticker(symbol)
         raw = self._yfinance_history(tk, kwargs, what=f"daily {symbol}")
         if raw is None or len(raw) == 0:
-            raise RuntimeError("yfinance returned no rows")
+            raise RuntimeError("no rows returned")
         if isinstance(getattr(raw, "columns", None), pd.MultiIndex):
             # yfinance occasionally returns ("Price", "Ticker") levels — flatten
             # so normalisation sees plain Open/High/Low/Close/Volume.

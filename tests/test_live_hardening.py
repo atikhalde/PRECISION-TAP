@@ -165,6 +165,60 @@ def test_both_providers_down_reports_both_errors(tmp_path, monkeypatch):
     assert "down-1" in bars.error and "down-2" in bars.error
 
 
+def test_both_providers_down_names_each_provider_once(tmp_path, monkeypatch):
+    """One label per provider — the failure message is read by a human.
+
+    The primary error is already built as ``<provider>: <what it said>``, so the
+    failover composition must not prefix it a second time; and the providers'
+    own raised texts must not open with their own name either.  What reached the
+    chat before: ``yfinance: yfinance: yfinance returned no rows; yahoo: yahoo
+    request failed after 3 tries: …``.
+    """
+    cfg = DataConfig(provider="yfinance", fallback_provider="yahoo", symbol_suffix=".NS",
+                     min_bars=50, lookback_days=400, cache_dir=str(tmp_path / "cache"),
+                     cache_max_age_minutes=0, eod_cache_max_age_minutes=0)
+    src = DataSource(cfg, live=False)
+    monkeypatch.setattr(DataSource, "_yfinance",
+                        lambda self, s, d, e: (_ for _ in ()).throw(RuntimeError("down-1")))
+    monkeypatch.setattr(DataSource, "_yahoo",
+                        lambda self, s, d, e: (_ for _ in ()).throw(RuntimeError("down-2")))
+    err = src.get("RELIANCE.NS").error
+    assert err == "yfinance: down-1; yahoo: down-2", err
+    assert err.count("yfinance") == 1 and err.count("yahoo") == 1
+    # the raised texts do not name their own provider (the caller labels them)
+    assert "request failed after" in _http_json_error_text(src)
+    assert not _http_json_error_text(src).startswith("yahoo")
+    assert not _yfinance_history_error_text().startswith("yfinance")
+
+
+def _http_json_error_text(src) -> str:
+    from precision_tap.data import DataSource
+    try:
+        src._http_json("http://127.0.0.1:1/nope", {})
+    except RuntimeError as exc:
+        return str(exc)
+    raise AssertionError("expected a RuntimeError")
+
+
+def _yfinance_history_error_text() -> str:
+    from precision_tap.data import DataSource
+
+    class _Tk:
+        symbol = "X.NS"
+
+        def history(self, **kw):
+            raise RuntimeError("boom")
+
+    cfg = DataConfig(provider="yfinance", symbol_suffix=".NS", retry_max=1,
+                     cache_dir="/tmp/pt-mut-test-cache")
+    src = DataSource(cfg, live=False)
+    try:
+        src._yfinance_history(_Tk(), {"period": "1d"}, what="daily X.NS")
+    except RuntimeError as exc:
+        return str(exc)
+    raise AssertionError("expected a RuntimeError")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Telegram validation without noise
 # ─────────────────────────────────────────────────────────────────────────────
