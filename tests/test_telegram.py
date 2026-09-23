@@ -93,3 +93,45 @@ def test_missing_token_raises(server):
     tg = TelegramClient(_cfg(server, bot_token=""))
     with pytest.raises(Exception):
         tg.send_text("x")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the sample credentials from `.env.example` are not credentials
+# ─────────────────────────────────────────────────────────────────────────────
+def test_sample_credentials_are_not_configured():
+    """`init` copies the template verbatim, so "token is set" must not mean "ready".
+
+    The sample token is well-formed (`<digits>:<secret>`), every check that only
+    tests for presence passes, and the only symptom is a 401 on the first alert.
+    A client holding it must report itself unconfigured, so alerts take the
+    documented log-only path instead of being marked *given up* after a failed
+    send.
+    """
+    from precision_tap.telegram import SAMPLE_BOT_TOKEN, SAMPLE_CHAT_ID, is_sample_credential
+
+    tg = TelegramClient(_cfg("http://127.0.0.1:1", bot_token=SAMPLE_BOT_TOKEN,
+                             chat_ids=[SAMPLE_CHAT_ID]))
+    assert tg.configured is False
+    assert is_sample_credential(SAMPLE_BOT_TOKEN, [SAMPLE_CHAT_ID]) is True
+
+    # a real-looking token is untouched, and a *missing* token is a different
+    # problem (missing ≠ sample — they are reported differently by `doctor`)
+    assert TelegramClient(_cfg("http://127.0.0.1:1")).configured is True
+    assert is_sample_credential("", []) is False
+    assert is_sample_credential("123:abc", ["42"]) is False
+    # the sample *token* cannot authenticate whatever chat id sits next to it ...
+    assert is_sample_credential(SAMPLE_BOT_TOKEN, ["555"]) is True
+    # ... while replacing it is enough to count as configured (a wrong chat id
+    # then fails honestly, with Telegram's own "chat not found")
+    assert is_sample_credential("999:realtoken", [SAMPLE_CHAT_ID]) is False
+
+
+def test_the_sample_constants_match_the_shipped_template():
+    """One source of truth: `.env.example` is what `init` writes into `.env`."""
+    from pathlib import Path
+
+    from precision_tap.telegram import SAMPLE_BOT_TOKEN, SAMPLE_CHAT_ID
+
+    env = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
+    assert f"TELEGRAM_BOT_TOKEN={SAMPLE_BOT_TOKEN}" in env
+    assert f"TELEGRAM_CHAT_ID={SAMPLE_CHAT_ID}" in env

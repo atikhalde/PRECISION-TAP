@@ -752,3 +752,34 @@ def test_a_weekday_holiday_reports_the_feed_as_behind(monkeypatch):
     assert note, rep.notes
     assert "holiday" in note[0] and "2026-09-11" in note[0]
     assert not any(n.startswith("MARKET CLOSED") for n in rep.notes), rep.notes
+
+
+def test_doctor_flags_the_sample_credentials_as_unconfigured(tmp_path, capsys):
+    """`init` + `doctor` must not report a repo ready to deliver when it is not.
+
+    `init` copies `.env.example` (sample token included), so a fresh checkout has
+    a *well-formed* token: the pre-fix doctor said "all checks passed" and the
+    first sign of trouble was a 401 on the first alert, days later.
+    """
+    from precision_tap.cli import cmd_doctor
+    from precision_tap.telegram import SAMPLE_BOT_TOKEN, SAMPLE_CHAT_ID
+
+    class A:
+        config = None
+        set = [f"telegram.bot_token={SAMPLE_BOT_TOKEN}", f"telegram.chat_ids={SAMPLE_CHAT_ID}",
+               f"state_db={tmp_path/'state.sqlite3'}"]
+        env_file = None
+        verbose = quiet = False
+        net = False
+        no_cache = True
+
+    rc = cmd_doctor(A())
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert "sample" in out and "some checks need attention" in out
+
+    # ... and a real token clears it (the check is about the sample, not about
+    # reaching the network — doctor without --net never sends anything)
+    A.set = ["telegram.bot_token=999:realtoken", "telegram.chat_ids=12345",
+             f"state_db={tmp_path/'state.sqlite3'}"]
+    assert cmd_doctor(A()) == 0

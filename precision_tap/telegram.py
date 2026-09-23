@@ -30,6 +30,27 @@ log = logging.getLogger("precision_tap.telegram")
 TG_MAX_LEN = 4096
 _MDV2_ESCAPES = r"_*[]()~`>#+-=|{}.!\\"
 
+#: Credentials shipped in `.env.example` — copied verbatim into `.env` by
+#: `precision_tap init`.  They are shaped like the real thing, so every check
+#: that only asks "is the token set?" says yes: `doctor` printed "all checks
+#: passed" on a repo that had never been configured, and the first symptom was a
+#: 401 on the first alert — possibly days later, in a chat nobody was reading.
+#: Treated as *not configured* instead, which is the documented "logged, never
+#: delivered" path, with a message that says exactly what to replace.
+SAMPLE_BOT_TOKEN = "123456789:AAExampleExampleExampleExampleExample"
+SAMPLE_CHAT_ID = "987654321"
+
+
+def is_sample_credential(token: str = "", chat_ids: Sequence[str] = ()) -> bool:
+    """Are the only credentials on offer the sample ones from the template?
+
+    An empty token is *missing*, not sample — the two are reported differently.
+    """
+    if (token or "").strip() == SAMPLE_BOT_TOKEN:
+        return True
+    ids = {str(c).strip() for c in (chat_ids or ()) if str(c).strip()}
+    return not (token or "").strip() and bool(ids) and ids <= {SAMPLE_CHAT_ID}
+
 
 def escape_markdownv2(text: str) -> str:
     return re.sub(rf"([{re.escape(_MDV2_ESCAPES)}])", r"\\\1", str(text))
@@ -111,7 +132,16 @@ class TelegramClient:
     # ── low level ────────────────────────────────────────────────────────
     @property
     def configured(self) -> bool:
-        return bool(self.cfg.bot_token) and bool(self.cfg.chat_ids)
+        """Can this client actually reach a chat the user owns?
+
+        The sample token from `.env.example` does not count: it is well-formed
+        enough to be sent to the Bot API and always comes back 401, so treating
+        it as configured turns "you never finished setup" into "delivery failed"
+        — and, worse, marks the alerts as *given up* instead of queueing them for
+        the first cycle that really works.
+        """
+        return (bool(self.cfg.bot_token) and bool(self.cfg.chat_ids)
+                and not is_sample_credential(self.cfg.bot_token, self.cfg.chat_ids))
 
     def _url(self, method: str) -> str:
         return f"{self.base}/bot{self.cfg.bot_token}/{method}"

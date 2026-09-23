@@ -102,6 +102,11 @@ Python ≥ 3.9. `matplotlib` is only needed for chart attachments / the equity P
    For a group/channel, add the bot and use its `-100…` id. No network? Test the whole delivery
    path locally: `python tools/mock_telegram_server.py 8099` + `--set telegram.api_base=http://127.0.0.1:8099`.
 
+   `init` copies this repo's `.env.example`, sample token included. That sample is well-formed, so
+   the scanner treats it as *unconfigured* rather than trying to send with it: `doctor` and
+   `livecheck` will say the credentials are still the sample ones, and every alert is logged, never
+   delivered — replace the token before expecting a chat to light up.
+
 ## 3. Sanity checks before going live
 
 ```bash

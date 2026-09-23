@@ -40,7 +40,7 @@ from .params import AlertConfig, DataConfig, TelegramConfig
 from .report import summary_message, write_backtest_report
 from .scanner import Scanner, _market_open
 from .state import StateStore
-from .telegram import TelegramClient
+from .telegram import TelegramClient, is_sample_credential
 
 log = logging.getLogger("precision_tap.cli")
 
@@ -188,6 +188,15 @@ def cmd_doctor(args) -> int:
     if cfg.telegram.enabled and not (tok and cfg.telegram.chat_ids):
         print("                  → set TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in .env")
         print("                  → until then every alert is logged, never delivered")
+        ok = False
+    elif cfg.telegram.enabled and is_sample_credential(tok, cfg.telegram.chat_ids):
+        # `init` copies `.env.example` verbatim, so the sample token is *set* and
+        # well-formed: only delivery fails, with a 401 nobody sees until the
+        # first alert.  Say it here, where the user is already looking.
+        print("                  → still the sample from `.env.example` / `init`: "
+              "no message can ever be delivered")
+        print("                  → create a bot with @BotFather, message it /start, then "
+              "`telegram-test --discover`")
         ok = False
     try:
         with StateStore(cfg.state_db) as st:
@@ -707,6 +716,10 @@ def cmd_livecheck(args) -> int:
     elif not (cfg.telegram.bot_token and cfg.telegram.chat_ids):
         failures.append("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID missing (.env)")
         print("telegram          token/chat MISSING → alerts are logged, never delivered")
+    elif is_sample_credential(cfg.telegram.bot_token, cfg.telegram.chat_ids):
+        failures.append("Telegram credentials are still the sample ones from `.env.example`")
+        print("telegram          sample token → every send returns 401; replace it "
+              "(@BotFather) and re-run")
     else:
         print(f"telegram          token {cfg.telegram.bot_token.split(':')[0]}:… · "
               f"{len(cfg.telegram.chat_ids)} chat id(s)")
