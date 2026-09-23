@@ -249,6 +249,96 @@ def check_pending_expiry() -> None:
     assert r.zones[0].taps >= 1
 
 
+def check_defence_gate_rule() -> None:
+    """Every gate of the Pine ``defence`` expression is individually required.
+
+    ``defence = barstate.isconfirmed and pending and close > open and
+    clv >= confirmCLV and rvol >= confirmRVOL and close > top and microBOS``
+
+    Each row below is a ``GOLDEN`` market whose Tap 1 sits on bar 7 and whose
+    bar 8 satisfies the other six gates but fails exactly one — so the engine
+    must not confirm it — followed by a twin that differs in nothing except
+    that gate and must confirm.  A deleted or weakened gate therefore cannot
+    survive this check, which is the difference between "the port looks like
+    the indicator" and "the port is the indicator".
+    """
+    quiet = (101.00, 101.10, 100.90, 100.95, 1000)     # no touch, close < open
+    low_tap = (99.60, 99.85, 99.30, 99.70, 5000)       # tap: high 99.85 stays BELOW top 100.00
+    pass_bar = (100.70, 101.30, 100.30, 101.25, 3000)  # the GOLDEN defence bar
+    cases = [
+        # gate                          frame                        confirm bars
+        ("baseline (all seven)",        GOLDEN[:8] + [pass_bar],      [8]),
+        ("close > open",                GOLDEN[:8] + [(101.35, 101.45, 100.80, 101.30, 3000)], []),
+        ("close > open (twin)",         GOLDEN[:8] + [(100.80, 101.45, 100.70, 101.30, 3000)], [8]),
+        ("clv >= confirmCLV",           GOLDEN[:8] + [(100.60, 101.90, 101.50, 101.60, 3000)], []),
+        ("clv >= confirmCLV (twin)",    GOLDEN[:8] + [(100.60, 101.90, 100.10, 101.60, 3000)], [8]),
+        ("rvol >= confirmRVOL",         GOLDEN[:8] + [(100.70, 101.30, 100.30, 101.25, 500)], []),
+        ("close > top",                 GOLDEN[:7] + [low_tap, (99.70, 100.00, 99.60, 99.95, 8000)], []),
+        ("close > top (twin)",          GOLDEN[:7] + [low_tap, (99.70, 100.20, 99.60, 100.05, 8000)], [8]),
+        ("microBOS",                    GOLDEN[:8] + [(100.60, 100.95, 100.10, 100.70, 3000)], []),
+        ("pending: gap == confirmBars", GOLDEN[:8] + [quiet, pass_bar], [9]),
+        ("pending: gap > confirmBars",  GOLDEN[:8] + [quiet, quiet, pass_bar], []),
+    ]
+    for label, bars, want in cases:
+        r = run_engine(golden_frame(bars), base_params(), symbol="GOLD")
+        got = [e.bar for e in r.by(EV_CONFIRMED)]
+        assert got == want, f"defence gate `{label}`: confirmed on {got}, expected {want}"
+
+    # the seven gates include `barstate.isconfirmed`: the same market cannot
+    # confirm on a bar that is still forming (TradingView "Once Per Bar")
+    live = run_engine(golden_frame(GOLDEN), base_params(), symbol="GOLD", intrabar_last=True)
+    assert live.by(EV_CONFIRMED) == [], "a forming bar must not confirm a defence"
+    assert bool(run_engine(golden_frame(GOLDEN), base_params(), symbol="GOLD").flags["any_confirm"][8])
+
+
+def check_defence_micro_bos_window() -> None:
+    """``microBOS = close > ta.highest(high[1], confirmBOSLen)`` — previous bars only.
+
+    Pine reads ``high[1]``, so the defence bar is *excluded* from its own
+    breakout window, and ``confirmBOSLen`` really picks the window: with the tap
+    bar's high at 100.90 and the two bars before it at 101.20 / 101.52, a close
+    of 101.45 clears a 1-bar high but not the 3-bar high.
+    """
+    def confirms(bars, **kw):
+        return [e.bar for e in run_engine(golden_frame(bars), base_params(**kw),
+                                          symbol="GOLD").by(EV_CONFIRMED)]
+
+    shallow = (100.70, 101.50, 100.30, 101.45, 3000)     # clv 0.958, close 101.45
+    assert confirms(GOLDEN[:8] + [shallow], confirm_bos_len=1) == [8]
+    assert confirms(GOLDEN[:8] + [shallow], confirm_bos_len=3) == [], \
+        "101.45 must not clear the 3-bar high 101.52"
+    assert confirms(GOLDEN[:8] + [(100.70, 101.65, 100.30, 101.60, 3000)], confirm_bos_len=3) == [8]
+    # the bar's OWN high does not count towards its breakout window
+    assert confirms(GOLDEN[:8] + [(100.70, 101.70, 100.30, 101.40, 3000)], confirm_bos_len=1) == [8], \
+        "microBOS must compare against high[1], not the defence bar's own high"
+
+
+def check_defence_event_records_the_rule() -> None:
+    """The 🛡 alert renders the indicator's rule from the *defence bar's* numbers.
+
+    ``Event.zone`` is a live reference, so a block that is tapped again after
+    confirming would otherwise make the message quote the later bar's tap count
+    and level.  The engine snapshots every gate value on the event; this pins
+    them to the bar the confirmation actually happened on.
+    """
+    retap = (100.90, 101.00, 99.95, 100.20, 1000)   # tap 2 on a *confirmed* block (state 2)
+    r = run_engine(golden_frame(GOLDEN + [retap]), base_params(), symbol="GOLD")
+    ev = r.by(EV_CONFIRMED)[0]
+    d = ev.detail
+    assert ev.bar == 8 and d["bars_since_tap"] == 1 and d["confirm_window"] == 2
+    assert d["closed_bar"] is True and d["taps_at_event"] == 1 and d["tap_bar"] == 7
+    assert r.zones[0].taps == 2, "fixture must tap the block again after the defence"
+    assert approx(d["open"], 100.70) and approx(d["close"], 101.25)
+    assert approx(d["zone_top"], 100.00) and approx(d["bos_ref"], 100.90)
+    assert approx(d["micro_bos"], 101.25 - 100.90)          # margin over the window high
+    assert approx(d["entry_at_event"], 100.00)              # the level Tap 1 touched
+    # every gate passed, so every value is on the correct side of its threshold
+    p = base_params()
+    assert d["close"] > d["open"] and d["clv"] >= p.confirm_clv and d["rvol"] >= p.confirm_rvol
+    assert d["close"] > d["zone_top"] and d["close"] > d["bos_ref"]
+    assert [e.kind for e in r.events].count(EV_CONFIRMED) == 1
+
+
 def check_exhaustion() -> None:
     """tapCount > maxTouches kills the zone (the winning tap is still recorded)."""
     bars = list(GOLDEN[:8])
@@ -371,6 +461,9 @@ CHECKS = [
     check_adaptive_entry,
     check_invalidation_ordering,
     check_pending_expiry,
+    check_defence_gate_rule,
+    check_defence_micro_bos_window,
+    check_defence_event_records_the_rule,
     check_exhaustion,
     check_sweep_requirement,
     check_intrabar_semantics,

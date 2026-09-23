@@ -177,6 +177,7 @@ State per zone (Pine comment: *"0 fresh, 1 tapped/pending, 2 confirmed, -1 inval
                         ┌───────────────────────────────┴────────────────────────────┐
    within confirmBars(3) bars: close>open & clv≥0.65 & rvol≥1.3 &                │
         close > top & close > highest(high[1],3)  ─────────────────────────────► 🛡 state 2 (DEFENCE CONFIRMED)
+        (a state-2 block is still tappable: retap → back to 1 → may confirm again)
    otherwise (bar_index - tapBar > confirmBars)  ──────────────────────────────► state 0 again (re-armable)
                                                                                         │
    close < stop  OR  taps > maxTouches(4)  ────────────────────────────────────► ❌ state -1 (dead, frozen)
@@ -237,17 +238,25 @@ partially-updated intraday feed therefore cannot make the scanner miss a signal 
 
 **What "100% match" means here, precisely:** *identical logic on identical bars.* Verified two ways:
 
-1. **18 hand-computed fixtures** (`selftest.py`) covering ATR seeding, warm-up `na` semantics, every zone method,
+1. **21 hand-computed fixtures** (`selftest.py`) covering ATR seeding, warm-up `na` semantics, every zone method,
    origin search + fallback, entry math for all four front-run modes, all six entry modes, `minAge`,
    `requireDeparture`, one-tap-per-bar, adaptive entry, pending expiry, exhaustion ordering, sweep gating, duplicate
-   veto, eviction, intrabar semantics and nearest-level bookkeeping.
+   veto, eviction, intrabar semantics, nearest-level bookkeeping — and, gate by gate, the `defence` expression:
+   each of `close > open`, `clv`, `rvol`, `close > top`, `microBOS`, the `pending` window (including the boundary at
+   `gap == confirmBars`), the closed-bar requirement, and the snapshot an `EV_CONFIRMED` carries.
 2. **A second, independent implementation.** `tests/pine_reference.py` is a fresh transliteration of
    `INDICATOR.txt` — its own naive `ta.sma/rma/atr/highest/lowest`, its own parallel zone arrays, the same statement
    order, written from the Pine source and sharing no code with `engine.py` or `series.py`.
-   `tests/test_pine_reference.py` runs both over five markets × 16 parameter sets × {closed bar, forming bar} and
+   `tests/test_pine_reference.py` runs both over **nine markets × 20 parameter sets × {closed bar, forming bar}** (360 comparisons) and
    requires agreement on the `plotshape` mask, all four `alertcondition` flags, the `nearestEntry`/`nearestStop`
    plots, the surviving zone arrays and the full event stream. A transcription mistake in either direction shows up
-   as a diff naming the bar and the field.
+   as a diff naming the bar and the field. Two of those markets exist only to make the **confirmation gates** bite:
+   a random walk almost never prints a bar that fails `close > open` / `clv >= confirmCLV` / `close > top` while
+   satisfying everything else, so those gates could be deleted from the engine with every other frame still
+   agreeing. `stress-defence-a/b` put a near-miss defence (bearish, low CLV, thin volume, close under `top`, close
+   under the 3-bar high, close inside the box) next to a control that passes, and `stress-retap` defends one block
+   **twice**, which is also the case that keeps the alert ledger honest (`alerts.dedupe_key` keys a `confirmed` by
+   zone *and bar*: a block can confirm on two bars of the same session, and the indicator prints two labels).
 
 It does **not** mean identical *data* — see §10.
 
@@ -263,7 +272,8 @@ It does **not** mean identical *data* — see §10.
    A 200-bar-old untouched OB is still "live" and can still alert. Use `alerts.max_age_bars` to impose your own TTL
    (the port adds this filter *without* touching the signal set).
 4. **Confirmed zones (state 2) can be tapped again** — `touched` only requires `state >= 0`. So "TAP 3" on a green box
-   is normal.
+   is normal, and a repeat tap *re-arms* the zone: it moves back to state 1 and the retest can be confirmed a second
+   time within `confirmBars`, printing a second `DEFENCE CONFIRMED` label.
 5. **After Tap 1 the entry moves UP** (`max(entry, low + 0.05×ATR)`), which makes later taps *easier*, not harder —
    intentional per the source comment ("later tests commonly turn just above Tap 1"), but it means repeat-tap counts can
    climb fast in chop, which interacts with (6).

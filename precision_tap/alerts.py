@@ -114,16 +114,79 @@ def passes_filters(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, *,
     return True, ""
 
 
+def _bar_stamp(ev: Event) -> str:
+    """The bar's wall-clock stamp, which is what makes two events the same event.
+
+    The *timestamp*, not the bar index: every scan cycle refetches the history,
+    so the index of the same bar moves around with the length of the frame while
+    its timestamp does not.  A frame with no timestamps (a hand-built one) falls
+    back to the index.
+    """
+    ts = ev.ts
+    if ts is None:
+        return str(ev.bar)
+    try:
+        return ts.isoformat()
+    except AttributeError:
+        return str(ts)
+
+
 def dedupe_key(ev: Event, cfg: AlertConfig) -> str:
-    day = ev.ts.date().isoformat() if ev.ts is not None else str(ev.bar)
+    """Identity of one alert, as stored in the state ledger.
+
+    ``state.seen`` compares these, so the key decides which events are *one*
+    signal and which are two:
+
+    * tap/approach — one message per symbol per session under
+      ``once_per_symbol_per_day``.  A level can be touched repeatedly and the
+      user asked to hear about the level once, so the day is the identity.
+    * new_ob / confirmed / invalidated — a state change, keyed by the zone *and*
+      the exact bar.  A block really can confirm twice in one session (tap →
+      confirm → retap → confirm) and both confirmation bars can share a date on
+      an intraday timeframe; keying those by ``(zone, day)`` would swallow the
+      second one, i.e. send less than the indicator's
+      ``DEFENCE CONFIRMED`` alertcondition fired.
+    """
+    stamp = _bar_stamp(ev)
     if cfg.once_per_symbol_per_day and ev.kind in (EV_TAP, EV_APPROACH):
-        return f"{ev.symbol}|{event_name(ev)}|{day}"
-    return f"{ev.symbol}|{event_name(ev)}|{ev.zid}|{day}"
+        return f"{ev.symbol}|{event_name(ev)}|{stamp[:10]}"
+    return f"{ev.symbol}|{event_name(ev)}|{ev.zid}|{stamp}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Rendering
 # ─────────────────────────────────────────────────────────────────────────────
+
+def defence_rule(params, *, top: Optional[float] = None) -> str:
+    """The indicator's ``defence`` expression as a one-line checklist.
+
+    ``INDICATOR.txt``:
+
+    .. code-block:: pine
+
+        pending  = state == 1 and tapBar >= 0 and bar_index - tapBar <= confirmBars
+        microBOS = close > ta.highest(high[1], confirmBOSLen)
+        defence  = barstate.isconfirmed and pending and close > open
+                   and clv >= confirmCLV and rvol >= confirmRVOL and close > top and microBOS
+
+    Same gates, same order.  The Tap alert quotes this with the configured
+    *thresholds* (so the reader knows what the 🛡 message will require); the
+    🛡 message quotes it with the defence bar's *values*.  A gate the
+    indicator checks but this string omits would be a silent difference
+    between the chat and the chart, so keep the two lists identical.
+    """
+    if params.confirm_bars > 0:
+        pending = f"closed bar within {params.confirm_bars} bars of the tap"
+    else:
+        pending = "closed bar, tap bar only (confirmBars = 0)"
+    parts = [pending, "close > open"]
+    if top is not None:
+        parts.append(f"close > {_num(top)}")
+    parts.append(f"CLV ≥ {_num(params.confirm_clv, 2)}")
+    parts.append(f"RVOL ≥ {_num(params.confirm_rvol, 1)}×")
+    parts.append(f"close > {params.confirm_bos_len}-bar high")
+    return " · ".join(parts)
+
 
 def render_lines(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) -> List[str]:
     z: Optional[Zone] = ev.zone
@@ -200,11 +263,9 @@ def render_lines(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) -> Li
         thr = entry + float(ctx.get("atr") or 0.0) * params.approach_atr
         lines.append(f"waiting for a touch of {_num(thr)}")
     if ev.kind == EV_TAP:
-        need = []
-        if params.confirm_bars > 0:
-            need.append(f"close > {_num(z.top)} within {params.confirm_bars} bars")
-            need.append(f"RVOL ≥ {_num(params.confirm_rvol, 1)}×, CLV ≥ {_num(params.confirm_clv, 2)}")
-        lines.append("defence: " + ", ".join(need) if need else "defence window disabled")
+        # The follow-up 🛡 alert is the *same rule* being satisfied, so the Tap
+        # message quotes the whole rule — thresholds, in the indicator's order.
+        lines.append("defence: " + defence_rule(params, top=z.top))
         lines.append("no retest of a defended level is guaranteed — size for the stop")
     if ev.kind == EV_CONFIRMED:
         lines.append(f"micro-BOS + close above the OB → defence confirmed (rvol {_num(rvol, 1)}×)")
@@ -227,7 +288,11 @@ def _confirmed_body(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) ->
     So the block answers a different set of questions:
 
     * which tap was defended, at what price, and how many bars it took;
-    * what the defence bar looked like (close vs OB top, RVOL, CLV, micro-BOS);
+    * the indicator's ``defence`` rule **gate by gate** — ``barstate.isconfirmed``,
+      the ``pending`` window, ``close > open``, ``clv >= confirmCLV``,
+      ``rvol >= confirmRVOL``, ``close > top`` and ``microBOS`` — each printed
+      with the defence bar's own numbers, so the alert can be diffed against
+      the chart instead of taken on trust;
     * where the stop still is and how far price has already travelled in R
       (the trade is *on*, and it may already be at R1 by the time this prints).
 
@@ -237,11 +302,16 @@ def _confirmed_body(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) ->
     price = float(ctx.get("price") or ev.price or z.top)
     close = float(ev.price) if math.isfinite(ev.price) else price
     stop = float(z.stop)
-    tap_bar = z.tap_bars[-1] if z.tap_bars else -1
+    tap_bar = int(ev.detail.get("tap_bar", z.tap_bars[-1] if z.tap_bars else -1))
     # The level that was *defended* is the one the last tap touched.  Tap 1 is
     # always at the creation level (`raise_after_first_tap` lifts the pre-order
-    # only after that touch); every later tap is at the live `entry`.
-    tapped_at = float(z.entry0) if z.taps <= 1 else float(z.entry)
+    # only after that touch); every later tap is at the live `entry`.  The
+    # engine snapshots both on the event, because a confirmed block can be
+    # tapped again *after* the defence bar and `zone.taps`/`zone.entry` would
+    # then describe that later bar, not the one this message is about.
+    taps = int(ev.detail.get("taps_at_event", z.taps))
+    tapped_at = float(ev.detail.get("entry_at_event",
+                                    float(z.entry0) if z.taps <= 1 else float(z.entry)))
     risk = tapped_at - stop
     gain = close - tapped_at
     r_now = gain / risk if risk else math.nan
@@ -253,7 +323,7 @@ def _confirmed_body(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) ->
     lines: List[str] = []
     lines.append(f"📌 Price        {_num(price)}"
                  + (f"  ({_pct(ctx.get('change_pct'))})" if ctx.get("change_pct") is not None else ""))
-    tap_lbl = f"Tap {z.taps}" if z.taps else "tap"
+    tap_lbl = f"Tap {taps}" if taps else "tap"
     lines.append(f"✅ Defended     {_num(tapped_at)}   ← {tap_lbl} held")
     lines.append(f"⬜ OB zone       {_num(z.top)} → {_num(z.bot)}")
     lines.append(f"🔴 Stop         {_num(stop)}   ({_pct(-(close - stop) / close * 100 if close else math.nan)} from close)")
@@ -264,20 +334,51 @@ def _confirmed_body(ev: Event, ctx: Dict[str, Any], cfg: AlertConfig, params) ->
     lines.append(f"📏 Open P&L     {_num(gain)} ({_num(r_now)} R from {tap_lbl})")
     lines.append(RULE_LINE)
 
-    facts: List[str] = []
-    if bars_to_confirm is not None:
-        unit = "bar" if bars_to_confirm == 1 else "bars"
-        facts.append(f"confirmed {bars_to_confirm} {unit} after the tap"
-                     f" (window {params.confirm_bars})")
-    if rvol is not None:
-        facts.append(f"RVOL {_num(rvol, 1)}× (≥ {_num(params.confirm_rvol, 1)})")
-    if clv is not None:
-        facts.append(f"CLV {_num(clv, 2)} (≥ {_num(params.confirm_clv, 2)})")
+    # ── the indicator's `defence` expression, gate by gate ───────────────
+    # INDICATOR.txt:
+    #   pending  = state == 1 and tapBar >= 0 and bar_index - tapBar <= confirmBars
+    #   microBOS = close > ta.highest(high[1], confirmBOSLen)
+    #   defence  = barstate.isconfirmed and pending and close > open
+    #              and clv >= confirmCLV and rvol >= confirmRVOL and close > top and microBOS
+    # Every gate is printed, in that order, with the defence bar's own numbers —
+    # so the alert can be checked against the chart instead of taken on trust.
+    d_open = ev.detail.get("open")
+    d_top = ev.detail.get("zone_top", z.top)
+    d_bos = ev.detail.get("bos_ref")
+    if d_bos is None and bos is not None and math.isfinite(float(bos)):
+        d_bos = close - float(bos)                 # micro_bos is the margin over the window high
+    closed = bool(ev.detail.get("closed_bar", True))
+    confirmed_bars = ev.detail.get("bars_since_tap", bars_to_confirm)
+    window = int(ev.detail.get("confirm_window", params.confirm_bars))
+
+    first: List[str] = []
+    if confirmed_bars is None:
+        first.append("confirmed")
+    elif int(confirmed_bars) == 0:
+        first.append(f"confirmed on the tap bar (window {window})")
+    else:
+        unit = "bar" if int(confirmed_bars) == 1 else "bars"
+        first.append(f"confirmed {int(confirmed_bars)} {unit} after the tap (window {window})")
+    first.append("closed bar ✔" if closed else "closed bar ✗")
+    first.append(f"close {_num(close)} > open {_num(d_open)} ✔"
+                 if d_open is not None and math.isfinite(float(d_open)) else "close > open ✔")
+    lines.append(" · ".join(first))
+
+    second: List[str] = []
+    second.append(f"CLV {_num(clv, 2)} (≥ {_num(params.confirm_clv, 2)}) ✔" if clv is not None
+                  else f"CLV ≥ {_num(params.confirm_clv, 2)} ✔")
+    second.append(f"RVOL {_num(rvol, 1)}× (≥ {_num(params.confirm_rvol, 1)}) ✔" if rvol is not None
+                  else f"RVOL ≥ {_num(params.confirm_rvol, 1)}× ✔")
+    second.append(f"close > OB top {_num(d_top)} ✔")
+    bos_txt = f"micro-BOS close {_num(close)} > {params.confirm_bos_len}-bar high"
+    bos_txt += f" {_num(d_bos)} ✔" if d_bos is not None and math.isfinite(float(d_bos)) \
+        else " ✔"
     if bos is not None and math.isfinite(float(bos)):
-        facts.append(f"micro-BOS +{_num(bos)} over {params.confirm_bos_len}-bar high")
-    lines.append(" · ".join(facts) if facts else "close > OB top with volume and a micro-BOS")
+        bos_txt += f" (by {_num(abs(float(bos)))})"
+    second.append(bos_txt)
+    lines.append(" · ".join(second))
     age = ev.bar - z.born
-    lines.append(f"zone age {age} bars · taps {z.taps}/{params.max_touches} · state → confirmed")
+    lines.append(f"zone age {age} bars · taps {taps}/{params.max_touches} · state → confirmed")
     origin = ctx.get("origin_date") or ""
     if origin:
         lines.append(f"origin candle {origin} · {ctx.get('zone_method', params.zone_method)}")

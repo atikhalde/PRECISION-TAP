@@ -160,6 +160,13 @@ def run_reference(df: pd.DataFrame, p, *, symbol: str = "",
     tick = float(p.mintick)
 
     # ── Detection group ────────────────────────────────────────────────────
+    # ``ta.atr`` is ``na`` for the first ``atrLen - 1`` bars and Pine's
+    # comparisons with ``na`` are *false* — ``rng >= atr * minRangeATR`` can
+    # never be satisfied there, so no displacement exists before the ATR is
+    # seeded.  Coercing ``na`` to 0.0 (as this file used to) invents zones the
+    # indicator would not draw, right where a differential test is least likely
+    # to look.  ``ai`` therefore stays ``na``; every use below either guards it
+    # or compares it (na comparisons are false in both languages).
     atr = ta_atr(h, l, c, p.atr_len)
     vol_ma = ta_sma(v, p.vol_len)
     rvol = [0.0 if _na(m) or m <= 0 else v[i] / m for i, m in enumerate(vol_ma)]
@@ -206,7 +213,7 @@ def run_reference(df: pd.DataFrame, p, *, symbol: str = "",
 
     for i in range(n):
         confirmed = not (intrabar_last and i == n - 1)      # barstate.isconfirmed
-        ai = atr[i] if not _na(atr[i]) else 0.0
+        ai = atr[i]                      # Pine `na` during warm-up — never 0.0
 
         # ── displacement ───────────────────────────────────────────────────
         displacement = (
@@ -298,7 +305,7 @@ def run_reference(df: pd.DataFrame, p, *, symbol: str = "",
             top, bot, entry, stop = tops[zi], bots[zi], entries[zi], stops[zi]
             age = i - born[zi]
 
-            if not departed[zi] and h[i] >= top + ai * p.require_departure:
+            if not departed[zi] and not _na(ai) and h[i] >= top + ai * p.require_departure:
                 departed[zi] = True
 
             if _na(ne) or abs(c[i] - entry) < abs(c[i] - ne):
